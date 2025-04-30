@@ -1,5 +1,5 @@
 -- Pomodoro timer module for Hammerspoon
-local log = hs.logger.new('pomodoro', 'debug')
+local log = hs.logger.new('pomodoro', 'info') -- Changed from 'debug' to 'info' level
 
 -- Initialize module
 local pomodoro = {}
@@ -7,7 +7,7 @@ local pomodoro = {}
 -- Constants
 local WORK_NOTIFICATION_TIME = 25 * 60  -- 25 minutes in seconds
 local SUBSEQUENT_NOTIFICATION_TIME = 27 * 60  -- 27 minutes in seconds
-local IDLE_THRESHOLD = 60  -- 1 minute in seconds
+local IDLE_THRESHOLD = 120  -- 2 minutes in seconds
 local RESET_THRESHOLD = 5 * 60  -- 5 minutes in seconds
 local PERSISTENCE_KEY = 'pomodoro.state'
 local CHECK_INTERVAL = 1  -- Check every second
@@ -54,6 +54,35 @@ local function formatTime(state, seconds)
     return "unknown"  -- Should never happen
 end
 
+-- Helper function to convert table to string for debugging
+local function tableToString(t)
+    if not t then return "nil" end
+    
+    local result = "{}"
+    local count = 0
+    for k, v in pairs(t) do
+        count = count + 1
+        if count <= 3 then
+            if count == 1 then
+                result = "{ "
+            else
+                result = result .. ", "
+            end
+            result = result .. tostring(k) .. ": " .. tostring(v)
+        end
+    end
+    
+    if count > 3 then
+        result = result .. ", ... (" .. count .. " items)"
+    end
+    
+    if count > 0 then
+        result = result .. " }"
+    end
+    
+    return result
+end
+
 -- Update menu bar display
 local function updateMenuBar()
     if pomodoro.menuBar then
@@ -66,6 +95,22 @@ local function updateMenuBar()
             formattedTime = formatTime(STATE.FRESH, 0)
         end
         pomodoro.menuBar:setTitle(formattedTime)
+        
+        -- Set click callback for the menubar item itself (not the dropdown menu)
+        pomodoro.menuBar:setClickCallback(function()
+            local minutes = math.floor(pomodoro.state.workTime / 60)
+            local seconds = pomodoro.state.workTime % 60
+            local stateInfo = string.format(
+                "State: %s\nWork time: %d min %d sec\nIdle time: %d sec\nNotifications: %s", 
+                pomodoro.state.currentState,
+                minutes,
+                seconds,
+                pomodoro.state.idleTime,
+                tableToString(pomodoro.state.notifiedAt)
+            )
+            hs.alert.show(stateInfo, 5)
+            return false  -- Return false to still show menu on right-click
+        end)
     end
 end
 
@@ -74,19 +119,27 @@ local function sendNotification(duration)
     local notification = hs.notify.new({
         title = "Pomodoro",
         informativeText = string.format("You've been working for %d minutes", math.floor(duration / 60)),
-        withdrawAfter = 0  -- Persist until dismissed
+        withdrawAfter = 0,  -- Persist until dismissed
+        hasActionButton = true,
+        actionButtonTitle = "OK",
+        soundName = hs.notify.defaultNotificationSound
     })
     notification:send()
     
     -- Record that we've notified at this time
     pomodoro.state.notifiedAt[duration] = true
+    log.d("Sent notification for duration:", duration)
 end
 
 -- Check if we need to send notifications
 local function checkNotifications()
+    log.d("Checking notifications at work time:", pomodoro.state.workTime)
+    
     -- First notification at 25 minutes
     if pomodoro.state.workTime >= WORK_NOTIFICATION_TIME and not pomodoro.state.notifiedAt[WORK_NOTIFICATION_TIME] then
+        log.d("Sending first notification at 25 minutes")
         sendNotification(WORK_NOTIFICATION_TIME)
+        return -- Return to prevent multiple notifications at once
     end
     
     -- Subsequent notifications every minute after 27 minutes
@@ -95,7 +148,9 @@ local function checkNotifications()
         for i = 0, minutesSinceSubsequent do
             local notificationTime = SUBSEQUENT_NOTIFICATION_TIME + (i * 60)
             if pomodoro.state.workTime >= notificationTime and not pomodoro.state.notifiedAt[notificationTime] then
+                log.d("Sending subsequent notification at time:", notificationTime)
                 sendNotification(notificationTime)
+                return -- Return to prevent multiple notifications at once
             end
         end
     end
@@ -103,15 +158,25 @@ end
 
 -- Save state to persistence
 local function saveState()
+    -- Convert notifiedAt table to use numeric values instead of booleans
+    local notifiedAtSave = {}
+    for k, v in pairs(pomodoro.state.notifiedAt) do
+        notifiedAtSave[tostring(k)] = 1  -- Use 1 instead of true
+    end
+    
     local stateToSave = {
         currentState = pomodoro.state.currentState,
         workTime = pomodoro.state.workTime,
         idleTime = pomodoro.state.idleTime,
-        lastUpdate = os.time()  -- Always save current time as last update
+        lastUpdate = os.time(),  -- Always save current time as last update
+        notifiedAt = notifiedAtSave  -- Save notification history with numeric values
     }
     hs.settings.set(PERSISTENCE_KEY, stateToSave)
-    -- Only log state saves when debugging is needed
-    -- log.d("State saved, last update:", stateToSave.lastUpdate)
+    
+    -- Only log state saves on significant changes (every minute of work)
+    if pomodoro.state.currentState == STATE.WORK and pomodoro.state.workTime % 60 == 0 then
+        log.d("State saved, current workTime:", stateToSave.workTime, "seconds")
+    end
 end
 
 -- Load state from persistence
@@ -129,11 +194,23 @@ local function loadState()
             pomodoro.state.currentState = STATE.FRESH
             pomodoro.state.workTime = 0
             pomodoro.state.idleTime = 0
+            pomodoro.state.notifiedAt = {}
         else
             -- Restore saved state
             pomodoro.state.currentState = savedState.currentState
             pomodoro.state.workTime = savedState.workTime
             pomodoro.state.idleTime = savedState.idleTime
+            
+            -- Convert numeric notifiedAt values back to booleans
+            pomodoro.state.notifiedAt = {}
+            if savedState.notifiedAt then
+                for k, v in pairs(savedState.notifiedAt) do
+                    -- Convert string keys back to numbers when appropriate
+                    local key = k
+                    if tonumber(k) then key = tonumber(k) end
+                    pomodoro.state.notifiedAt[key] = true
+                end
+            end
             
             -- If we were working before, add the time we were away (if it was less than idle threshold)
             if pomodoro.state.currentState == STATE.WORK and timeSinceLastUpdate < IDLE_THRESHOLD then
@@ -147,6 +224,7 @@ local function loadState()
                     pomodoro.state.currentState = STATE.FRESH
                     pomodoro.state.workTime = 0
                     pomodoro.state.idleTime = 0
+                    pomodoro.state.notifiedAt = {}
                 end
             end
         end
@@ -198,7 +276,11 @@ local function timerCallback()
         elseif pomodoro.state.currentState == STATE.WORK then
             -- Already in work state, increment work time
             pomodoro.state.workTime = pomodoro.state.workTime + elapsed
-            checkNotifications()  -- Check if we need to send notifications
+            
+            -- Check if time to send notification
+            if pomodoro.state.workTime >= WORK_NOTIFICATION_TIME then
+                checkNotifications()  -- Check if we need to send notifications
+            end
         end
     end
     
@@ -215,6 +297,35 @@ function pomodoro.init()
     pomodoro.menuBar = hs.menubar.new()
     if pomodoro.menuBar then
         updateMenuBar()
+        
+        -- Add menu options
+        pomodoro.menuBar:setMenu(function()
+            -- Get real-time values every time the menu is opened
+            local workMinutes = math.floor(pomodoro.state.workTime / 60)
+            local workSeconds = pomodoro.state.workTime % 60
+            local idleMinutes = math.floor(pomodoro.state.idleTime / 60)
+            local idleSeconds = pomodoro.state.idleTime % 60
+            
+            return {
+                { title = "Reset Timer", fn = function()
+                    pomodoro.state.currentState = STATE.FRESH
+                    pomodoro.state.workTime = 0
+                    pomodoro.state.idleTime = 0
+                    pomodoro.state.notifiedAt = {}
+                    updateMenuBar()
+                    saveState()
+                    hs.alert.show("Timer reset")
+                end },
+                { title = "Test Notification", fn = function()
+                    sendNotification(WORK_NOTIFICATION_TIME)
+                end },
+                { title = "-" },  -- Separator
+                { title = string.format("Time Working: %02d:%02d", workMinutes, workSeconds), disabled = true },
+                { title = string.format("Idle Time: %02d:%02d", idleMinutes, idleSeconds), disabled = true },
+                { title = string.format("Current State: %s", pomodoro.state.currentState), disabled = true },
+                { title = string.format("Notification at: %d minutes", WORK_NOTIFICATION_TIME / 60), disabled = true }
+            }
+        end)
     end
     
     -- Load saved state
@@ -223,7 +334,7 @@ function pomodoro.init()
     -- Start the timer
     pomodoro.timer = hs.timer.doEvery(CHECK_INTERVAL, timerCallback)
     
-    log.d("Pomodoro timer initialized")
+    log.d("Pomodoro timer initialized with notification at", WORK_NOTIFICATION_TIME, "seconds")
     return pomodoro
 end
 
