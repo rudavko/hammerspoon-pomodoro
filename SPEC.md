@@ -66,7 +66,7 @@ Formatting notes:
 | Milestone | Condition | Behaviour |
 |-----------|-----------|-----------|
 | **First alert** | Reaches **25 min** in **Work** state | Display an **Alert** with title *“25 minutes of focused work 🎉”* and a single button **“Start break”*. |
-| **Subsequent alerts** | Still in **Work** *and* last alert acknowledged or dismissed | Fire **each minute** at 27 m, 28 m, 29 m, … |
+| **Subsequent alerts** | Still in **Work** *and* last alert acknowledged or dismissed | Fire **each two minute** at 27 m, 28 m, 29 m, … |
 | **Suppression** | If an alert window is still open, **do not** spawn another. Maximum one outstanding alert. |
 | **Break button** | Merely records *acknowledged_at = timestamp*. **Does not** force a state change; true break = 5 min **Idle**. |
 

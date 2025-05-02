@@ -4,9 +4,13 @@ local log = hs.logger.new('pomodoro', 'info') -- Changed from 'debug' to 'info' 
 -- Initialize module
 local pomodoro = {}
 
+-- Load the enhanced notification module
+local notification = require('pomodoro.notification')
+
 -- Constants
 local WORK_NOTIFICATION_TIME = 25 * 60  -- 25 minutes in seconds
 local SUBSEQUENT_NOTIFICATION_TIME = 27 * 60  -- 27 minutes in seconds
+local MAX_NOTIFICATION_TIME = 29 * 60  -- 29 minutes in seconds, notifications stop after this
 local IDLE_THRESHOLD = 120  -- 2 minutes in seconds
 local RESET_THRESHOLD = 5 * 60  -- 5 minutes in seconds
 local PERSISTENCE_KEY = 'pomodoro.state'
@@ -25,7 +29,8 @@ pomodoro.state = {
     workTime = 0,  -- Seconds
     idleTime = 0,  -- Seconds
     lastUpdate = os.time(),  -- When state was last updated
-    notifiedAt = {}  -- Track notification times
+    notifiedAt = {},  -- Track notification times
+    lastNotificationAcknowledged = true  -- Track if the last notification was acknowledged
 }
 
 -- Menu bar item
@@ -33,6 +38,12 @@ pomodoro.menuBar = nil
 
 -- Timers
 pomodoro.timer = nil
+
+-- Enhanced notification elements reference
+pomodoro.enhancedNotificationElements = nil
+
+-- Initialize the notification module with references to pomodoro and logger
+notification.init(pomodoro, log)
 
 -- Format time for display
 local function formatTime(state, seconds)
@@ -101,12 +112,13 @@ local function updateMenuBar()
             local minutes = math.floor(pomodoro.state.workTime / 60)
             local seconds = pomodoro.state.workTime % 60
             local stateInfo = string.format(
-                "State: %s\nWork time: %d min %d sec\nIdle time: %d sec\nNotifications: %s", 
+                "State: %s\nWork time: %d min %d sec\nIdle time: %d sec\nNotifications: %s\nLast notification acknowledged: %s", 
                 pomodoro.state.currentState,
                 minutes,
                 seconds,
                 pomodoro.state.idleTime,
-                tableToString(pomodoro.state.notifiedAt)
+                tableToString(pomodoro.state.notifiedAt),
+                pomodoro.state.lastNotificationAcknowledged and "Yes" or "No"
             )
             hs.alert.show(stateInfo, 5)
             return false  -- Return false to still show menu on right-click
@@ -116,24 +128,15 @@ end
 
 -- Send a notification
 local function sendNotification(duration)
-    local notification = hs.notify.new({
-        title = "Pomodoro",
-        informativeText = string.format("You've been working for %d minutes", math.floor(duration / 60)),
-        withdrawAfter = 0,  -- Persist until dismissed
-        hasActionButton = true,
-        actionButtonTitle = "OK",
-        soundName = hs.notify.defaultNotificationSound
-    })
-    notification:send()
-    
-    -- Record that we've notified at this time
-    pomodoro.state.notifiedAt[duration] = true
-    log.d("Sent notification for duration:", duration)
+    notification.sendNotification(duration)
 end
 
 -- Check if we need to send notifications
 local function checkNotifications()
     log.d("Checking notifications at work time:", pomodoro.state.workTime)
+    
+    -- Don't send new standard notifications if the previous one hasn't been acknowledged
+    -- But we will allow enhanced notifications to be shown
     
     -- First notification at 25 minutes
     if pomodoro.state.workTime >= WORK_NOTIFICATION_TIME and not pomodoro.state.notifiedAt[WORK_NOTIFICATION_TIME] then
@@ -142,12 +145,42 @@ local function checkNotifications()
         return -- Return to prevent multiple notifications at once
     end
     
-    -- Subsequent notifications every minute after 27 minutes
-    if pomodoro.state.workTime >= SUBSEQUENT_NOTIFICATION_TIME then
+    -- Enhanced notification at 27 minutes if previous notification wasn't acknowledged
+    if pomodoro.state.workTime >= SUBSEQUENT_NOTIFICATION_TIME and 
+       not pomodoro.state.lastNotificationAcknowledged and
+       not pomodoro.state.notifiedAt[SUBSEQUENT_NOTIFICATION_TIME] then
+        log.d("Sending enhanced notification at 27 minutes")
+        
+        -- Only show if we don't already have an enhanced notification window open
+        if not pomodoro.enhancedNotificationElements then
+            -- Wrap in pcall to prevent errors from disrupting the timer
+            local success, result = pcall(function()
+                pomodoro.enhancedNotificationElements = notification.showPictureInPictureAlert(SUBSEQUENT_NOTIFICATION_TIME)
+                return pomodoro.enhancedNotificationElements
+            end)
+            
+            if not success then
+                log.e("Error showing enhanced notification:", result)
+                -- Fall back to standard notification
+                sendNotification(SUBSEQUENT_NOTIFICATION_TIME)
+            end
+        end
+        return -- Return to prevent multiple notifications at once
+    end
+    
+    -- Subsequent notifications every minute after 27 minutes but only up to MAX_NOTIFICATION_TIME
+    -- These will only be shown if previous notifications were acknowledged
+    if pomodoro.state.workTime >= SUBSEQUENT_NOTIFICATION_TIME and 
+       pomodoro.state.workTime <= MAX_NOTIFICATION_TIME and
+       pomodoro.state.lastNotificationAcknowledged then
+        
         local minutesSinceSubsequent = math.floor((pomodoro.state.workTime - SUBSEQUENT_NOTIFICATION_TIME) / 60)
         for i = 0, minutesSinceSubsequent do
             local notificationTime = SUBSEQUENT_NOTIFICATION_TIME + (i * 60)
-            if pomodoro.state.workTime >= notificationTime and not pomodoro.state.notifiedAt[notificationTime] then
+            -- Only send notifications up to the maximum time
+            if notificationTime <= MAX_NOTIFICATION_TIME and 
+               pomodoro.state.workTime >= notificationTime and 
+               not pomodoro.state.notifiedAt[notificationTime] then
                 log.d("Sending subsequent notification at time:", notificationTime)
                 sendNotification(notificationTime)
                 return -- Return to prevent multiple notifications at once
@@ -169,7 +202,8 @@ local function saveState()
         workTime = pomodoro.state.workTime,
         idleTime = pomodoro.state.idleTime,
         lastUpdate = os.time(),  -- Always save current time as last update
-        notifiedAt = notifiedAtSave  -- Save notification history with numeric values
+        notifiedAt = notifiedAtSave,  -- Save notification history with numeric values
+        lastNotificationAcknowledged = pomodoro.state.lastNotificationAcknowledged  -- Save acknowledgment state
     }
     hs.settings.set(PERSISTENCE_KEY, stateToSave)
     
@@ -195,11 +229,24 @@ local function loadState()
             pomodoro.state.workTime = 0
             pomodoro.state.idleTime = 0
             pomodoro.state.notifiedAt = {}
+            pomodoro.state.lastNotificationAcknowledged = true
+            
+            -- Clean up enhanced notification window if it exists
+            if pomodoro.enhancedNotificationElements then
+                notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
+                pomodoro.enhancedNotificationElements = nil
+            end
         else
             -- Restore saved state
             pomodoro.state.currentState = savedState.currentState
             pomodoro.state.workTime = savedState.workTime
             pomodoro.state.idleTime = savedState.idleTime
+            
+            -- Restore acknowledgment state, defaulting to true if not present (for backward compatibility)
+            pomodoro.state.lastNotificationAcknowledged = savedState.lastNotificationAcknowledged
+            if pomodoro.state.lastNotificationAcknowledged == nil then
+                pomodoro.state.lastNotificationAcknowledged = true
+            end
             
             -- Convert numeric notifiedAt values back to booleans
             pomodoro.state.notifiedAt = {}
@@ -225,6 +272,12 @@ local function loadState()
                     pomodoro.state.workTime = 0
                     pomodoro.state.idleTime = 0
                     pomodoro.state.notifiedAt = {}
+                    
+                    -- Clean up enhanced notification window if it exists
+                    if pomodoro.enhancedNotificationElements then
+                        notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
+                        pomodoro.enhancedNotificationElements = nil
+                    end
                 end
             end
         end
@@ -251,6 +304,13 @@ local function timerCallback()
             pomodoro.state.workTime = 0
             pomodoro.state.idleTime = 0
             pomodoro.state.notifiedAt = {}  -- Reset notifications
+            pomodoro.state.lastNotificationAcknowledged = true  -- Reset acknowledgment state
+            
+            -- Clean up enhanced notification window if it exists
+            if pomodoro.enhancedNotificationElements then
+                notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
+                pomodoro.enhancedNotificationElements = nil
+            end
         end
     elseif idleTime >= IDLE_THRESHOLD then
         -- User has been idle for 1+ minute but less than 5 minutes
@@ -273,6 +333,13 @@ local function timerCallback()
             pomodoro.state.workTime = 0  -- Reset work timer when coming from FRESH or IDLE
             pomodoro.state.idleTime = 0
             pomodoro.state.notifiedAt = {}  -- Reset notifications
+            pomodoro.state.lastNotificationAcknowledged = true  -- Reset acknowledgment state
+            
+            -- Clean up enhanced notification window if it exists
+            if pomodoro.enhancedNotificationElements then
+                notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
+                pomodoro.enhancedNotificationElements = nil
+            end
         elseif pomodoro.state.currentState == STATE.WORK then
             -- Already in work state, increment work time
             pomodoro.state.workTime = pomodoro.state.workTime + elapsed
@@ -312,18 +379,32 @@ function pomodoro.init()
                     pomodoro.state.workTime = 0
                     pomodoro.state.idleTime = 0
                     pomodoro.state.notifiedAt = {}
+                    pomodoro.state.lastNotificationAcknowledged = true
+                    
+                    -- Clean up enhanced notification window if it exists
+                    if pomodoro.enhancedNotificationElements then
+                        notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
+                        pomodoro.enhancedNotificationElements = nil
+                    end
+                    
                     updateMenuBar()
                     saveState()
                     hs.alert.show("Timer reset")
                 end },
                 { title = "Test Notification", fn = function()
-                    sendNotification(WORK_NOTIFICATION_TIME)
+                    notification.sendNotification(WORK_NOTIFICATION_TIME)
+                end },
+                { title = "Test Enhanced Notification", fn = function()
+                    pcall(function()
+                        pomodoro.enhancedNotificationElements = notification.showPictureInPictureAlert(SUBSEQUENT_NOTIFICATION_TIME)
+                    end)
                 end },
                 { title = "-" },  -- Separator
                 { title = string.format("Time Working: %02d:%02d", workMinutes, workSeconds), disabled = true },
                 { title = string.format("Idle Time: %02d:%02d", idleMinutes, idleSeconds), disabled = true },
                 { title = string.format("Current State: %s", pomodoro.state.currentState), disabled = true },
-                { title = string.format("Notification at: %d minutes", WORK_NOTIFICATION_TIME / 60), disabled = true }
+                { title = string.format("Notification at: %d-%d minutes", WORK_NOTIFICATION_TIME / 60, MAX_NOTIFICATION_TIME / 60), disabled = true },
+                { title = string.format("Last notification acknowledged: %s", pomodoro.state.lastNotificationAcknowledged and "Yes" or "No"), disabled = true }
             }
         end)
     end
@@ -345,10 +426,19 @@ function pomodoro.stop()
         pomodoro.timer = nil
     end
     
+    -- Clean up enhanced notification window if it exists
+    if pomodoro.enhancedNotificationElements then
+        notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
+        pomodoro.enhancedNotificationElements = nil
+    end
+    
     if pomodoro.menuBar then
         pomodoro.menuBar:delete()
         pomodoro.menuBar = nil
     end
+    
+    -- Save state before stopping
+    saveState()
     
     log.d("Pomodoro timer stopped")
 end
