@@ -15,7 +15,8 @@ local IDLE_THRESHOLD = 120  -- 2 minutes in seconds
 local RESET_THRESHOLD = 5 * 60  -- 5 minutes in seconds
 local PERSISTENCE_KEY = 'pomodoro.state'
 local CHECK_INTERVAL = 1  -- Check every second
-
+local BANNER_GRACE    = 60   -- seconds
+local REPEAT_INTERVAL = 120  -- seconds
 -- States
 local STATE = {
     WORK = 'work',
@@ -38,12 +39,16 @@ pomodoro.menuBar = nil
 
 -- Timers
 pomodoro.timer = nil
+pomodoro.bannerHandle  = nil
+pomodoro.overlayHandle = nil
+pomodoro.bannerSentAt  = nil
+pomodoro.repeatTimer   = nil
 
 -- Enhanced notification elements reference
 pomodoro.enhancedNotificationElements = nil
 
 -- Initialize the notification module with references to pomodoro and logger
-notification.init(pomodoro, log)
+notification.init(log)
 
 -- Format time for display
 local function formatTime(state, seconds)
@@ -131,62 +136,62 @@ local function sendNotification(duration)
     notification.sendNotification(duration)
 end
 
--- Check if we need to send notifications
+local function scheduleRepeat()
+  if pomodoro.repeatTimer then pomodoro.repeatTimer:stop() end
+  pomodoro.repeatTimer = hs.timer.doAfter(REPEAT_INTERVAL, function()
+      if pomodoro.state.currentState == STATE.WORK then
+        raiseBanner()
+      end
+    end)
+end
+
+function raiseBanner()
+  pomodoro.bannerHandle = notification.showBanner(
+      math.floor(pomodoro.state.workTime / 60),
+      function()
+        pomodoro.state.lastNotificationAcknowledged = true
+        if pomodoro.bannerHandle then
+          notification.dismiss(pomodoro.bannerHandle)
+          pomodoro.bannerHandle = nil
+        end
+        if pomodoro.overlayHandle then
+          notification.dismiss(pomodoro.overlayHandle)
+          pomodoro.overlayHandle = nil
+        end
+        scheduleRepeat()
+      end)
+  pomodoro.bannerSentAt = os.time()
+  pomodoro.state.lastNotificationAcknowledged = false
+end
 local function checkNotifications()
-    log.d("Checking notifications at work time:", pomodoro.state.workTime)
-    
-    -- Don't send new standard notifications if the previous one hasn't been acknowledged
-    -- But we will allow enhanced notifications to be shown
-    
-    -- First notification at 25 minutes
-    if pomodoro.state.workTime >= WORK_NOTIFICATION_TIME and not pomodoro.state.notifiedAt[WORK_NOTIFICATION_TIME] then
-        log.d("Sending first notification at 25 minutes")
-        sendNotification(WORK_NOTIFICATION_TIME)
-        return -- Return to prevent multiple notifications at once
-    end
-    
-    -- Enhanced notification at 27 minutes if previous notification wasn't acknowledged
-    if pomodoro.state.workTime >= SUBSEQUENT_NOTIFICATION_TIME and 
-       not pomodoro.state.lastNotificationAcknowledged and
-       not pomodoro.state.notifiedAt[SUBSEQUENT_NOTIFICATION_TIME] then
-        log.d("Sending enhanced notification at 27 minutes")
-        
-        -- Only show if we don't already have an enhanced notification window open
-        if not pomodoro.enhancedNotificationElements then
-            -- Wrap in pcall to prevent errors from disrupting the timer
-            local success, result = pcall(function()
-                pomodoro.enhancedNotificationElements = notification.showPictureInPictureAlert(SUBSEQUENT_NOTIFICATION_TIME)
-                return pomodoro.enhancedNotificationElements
-            end)
-            
-            if not success then
-                log.e("Error showing enhanced notification:", result)
-                -- Fall back to standard notification
-                sendNotification(SUBSEQUENT_NOTIFICATION_TIME)
-            end
-        end
-        return -- Return to prevent multiple notifications at once
-    end
-    
-    -- Subsequent notifications every minute after 27 minutes but only up to MAX_NOTIFICATION_TIME
-    -- These will only be shown if previous notifications were acknowledged
-    if pomodoro.state.workTime >= SUBSEQUENT_NOTIFICATION_TIME and 
-       pomodoro.state.workTime <= MAX_NOTIFICATION_TIME and
-       pomodoro.state.lastNotificationAcknowledged then
-        
-        local minutesSinceSubsequent = math.floor((pomodoro.state.workTime - SUBSEQUENT_NOTIFICATION_TIME) / 60)
-        for i = 0, minutesSinceSubsequent do
-            local notificationTime = SUBSEQUENT_NOTIFICATION_TIME + (i * 60)
-            -- Only send notifications up to the maximum time
-            if notificationTime <= MAX_NOTIFICATION_TIME and 
-               pomodoro.state.workTime >= notificationTime and 
-               not pomodoro.state.notifiedAt[notificationTime] then
-                log.d("Sending subsequent notification at time:", notificationTime)
-                sendNotification(notificationTime)
-                return -- Return to prevent multiple notifications at once
-            end
-        end
-    end
+  -- initial banner
+  if pomodoro.state.workTime >= WORK_NOTIFICATION_TIME
+     and not pomodoro.bannerHandle
+     and pomodoro.state.currentState == STATE.WORK then
+       raiseBanner()
+  end
+
+  -- escalate with overlay
+  if pomodoro.bannerHandle
+     and not pomodoro.state.lastNotificationAcknowledged
+     and (os.time() - pomodoro.bannerSentAt) >= BANNER_GRACE
+     and not pomodoro.overlayHandle then
+
+       pomodoro.overlayHandle = notification.showOverlay(
+           math.floor(pomodoro.state.workTime / 60),
+           function()
+             pomodoro.state.lastNotificationAcknowledged = true
+             if pomodoro.bannerHandle then
+               notification.dismiss(pomodoro.bannerHandle)
+               pomodoro.bannerHandle = nil
+             end
+             if pomodoro.overlayHandle then
+               notification.dismiss(pomodoro.overlayHandle)
+               pomodoro.overlayHandle = nil
+             end
+             scheduleRepeat()
+           end)
+  end
 end
 
 -- Save state to persistence
@@ -391,14 +396,6 @@ function pomodoro.init()
                     saveState()
                     hs.alert.show("Timer reset")
                 end },
-                { title = "Test Notification", fn = function()
-                    notification.sendNotification(WORK_NOTIFICATION_TIME)
-                end },
-                { title = "Test Enhanced Notification", fn = function()
-                    pcall(function()
-                        pomodoro.enhancedNotificationElements = notification.showPictureInPictureAlert(SUBSEQUENT_NOTIFICATION_TIME)
-                    end)
-                end },
                 { title = "-" },  -- Separator
                 { title = string.format("Time Working: %02d:%02d", workMinutes, workSeconds), disabled = true },
                 { title = string.format("Idle Time: %02d:%02d", idleMinutes, idleSeconds), disabled = true },
@@ -435,6 +432,16 @@ function pomodoro.stop()
     if pomodoro.menuBar then
         pomodoro.menuBar:delete()
         pomodoro.menuBar = nil
+    end
+
+        if pomodoro.bannerHandle then
+        notification.dismiss(pomodoro.bannerHandle)
+        pomodoro.bannerHandle = nil
+    end
+
+    if pomodoro.repeatTimer then
+        pomodoro.repeatTimer:stop()
+        pomodoro.repeatTimer = nil
     end
     
     -- Save state before stopping
