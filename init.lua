@@ -17,11 +17,17 @@ local PERSISTENCE_KEY = 'pomodoro.state'
 local CHECK_INTERVAL = 1  -- Check every second
 local BANNER_GRACE    = 60   -- seconds
 local REPEAT_INTERVAL = 120  -- seconds
--- States
 local STATE = {
     WORK = 'work',
     IDLE = 'idle',
     FRESH = 'fresh'
+}
+
+-- Notification view‑modes (finite‑state machine)
+local NOTIFY_MODE = {
+    NONE    = "none",
+    BANNER  = "banner",
+    OVERLAY = "overlay"
 }
 
 -- State variables
@@ -42,7 +48,11 @@ pomodoro.timer = nil
 pomodoro.bannerHandle  = nil
 pomodoro.overlayHandle = nil
 pomodoro.bannerSentAt  = nil
-pomodoro.repeatTimer   = nil
+
+-- Notification‑FSM runtime fields
+pomodoro.notificationMode    = NOTIFY_MODE.NONE   -- current view‑state
+pomodoro.notificationEntered = nil                -- os.time() when mode entered
+pomodoro.nextBannerDue       = nil                -- next allowed banner time
 
 -- Enhanced notification elements reference
 pomodoro.enhancedNotificationElements = nil
@@ -136,62 +146,73 @@ local function sendNotification(duration)
     notification.sendNotification(duration)
 end
 
-local function scheduleRepeat()
-  if pomodoro.repeatTimer then pomodoro.repeatTimer:stop() end
-  pomodoro.repeatTimer = hs.timer.doAfter(REPEAT_INTERVAL, function()
-      if pomodoro.state.currentState == STATE.WORK then
-        raiseBanner()
-      end
-    end)
-end
 
 function raiseBanner()
-  pomodoro.bannerHandle = notification.showBanner(
-      math.floor(pomodoro.state.workTime / 60),
-      function()
-        pomodoro.state.lastNotificationAcknowledged = true
-        if pomodoro.bannerHandle then
-          notification.dismiss(pomodoro.bannerHandle)
-          pomodoro.bannerHandle = nil
-        end
-        if pomodoro.overlayHandle then
-          notification.dismiss(pomodoro.overlayHandle)
-          pomodoro.overlayHandle = nil
-        end
-        scheduleRepeat()
-      end)
-  pomodoro.bannerSentAt = os.time()
-  pomodoro.state.lastNotificationAcknowledged = false
+    -- draw banner
+    pomodoro.bannerHandle = notification.showBanner(
+        math.floor(pomodoro.state.workTime / 60),
+        function()  -- onClick
+            -- user acknowledged
+            pomodoro.state.lastNotificationAcknowledged = true
+            if pomodoro.bannerHandle then
+                notification.dismiss(pomodoro.bannerHandle)
+                pomodoro.bannerHandle = nil
+            end
+            pomodoro.notificationMode    = NOTIFY_MODE.NONE
+            pomodoro.notificationEntered = nil
+            pomodoro.nextBannerDue       = os.time() + REPEAT_INTERVAL
+        end)
+
+    pomodoro.notificationMode    = NOTIFY_MODE.BANNER
+    pomodoro.notificationEntered = os.time()
+    pomodoro.state.lastNotificationAcknowledged = false
 end
-local function checkNotifications()
-  -- initial banner
-  if pomodoro.state.workTime >= WORK_NOTIFICATION_TIME
-     and not pomodoro.bannerHandle
-     and pomodoro.state.currentState == STATE.WORK then
-       raiseBanner()
-  end
 
-  -- escalate with overlay
-  if pomodoro.bannerHandle
-     and not pomodoro.state.lastNotificationAcknowledged
-     and (os.time() - pomodoro.bannerSentAt) >= BANNER_GRACE
-     and not pomodoro.overlayHandle then
+local function raiseOverlay()
+    -- hide banner if still present
+    if pomodoro.bannerHandle then
+        notification.dismiss(pomodoro.bannerHandle)
+        pomodoro.bannerHandle = nil
+    end
 
-       pomodoro.overlayHandle = notification.showOverlay(
-           math.floor(pomodoro.state.workTime / 60),
-           function()
-             pomodoro.state.lastNotificationAcknowledged = true
-             if pomodoro.bannerHandle then
-               notification.dismiss(pomodoro.bannerHandle)
-               pomodoro.bannerHandle = nil
-             end
-             if pomodoro.overlayHandle then
-               notification.dismiss(pomodoro.overlayHandle)
-               pomodoro.overlayHandle = nil
-             end
-             scheduleRepeat()
-           end)
-  end
+    pomodoro.overlayHandle = notification.showOverlay(
+        math.floor(pomodoro.state.workTime / 60),
+        function()  -- onDismiss
+            pomodoro.state.lastNotificationAcknowledged = true
+            if pomodoro.overlayHandle then
+                notification.dismiss(pomodoro.overlayHandle)
+                pomodoro.overlayHandle = nil
+            end
+            pomodoro.notificationMode    = NOTIFY_MODE.NONE
+            pomodoro.notificationEntered = nil
+            pomodoro.nextBannerDue       = os.time() + REPEAT_INTERVAL
+        end)
+
+    pomodoro.notificationMode    = NOTIFY_MODE.OVERLAY
+    pomodoro.notificationEntered = os.time()
+end
+
+local function updateNotifications(now)
+    -- guard: only operate in WORK state
+    if pomodoro.state.currentState ~= STATE.WORK then return end
+
+    -- state machine
+    if pomodoro.notificationMode == NOTIFY_MODE.NONE then
+        -- First banner at 25 min or a repeat banner when due
+        if (pomodoro.state.workTime >= WORK_NOTIFICATION_TIME) and
+           (pomodoro.nextBannerDue == nil or now >= pomodoro.nextBannerDue) then
+            raiseBanner()
+        end
+
+    elseif pomodoro.notificationMode == NOTIFY_MODE.BANNER then
+        -- Escalate if unacknowledged for BANNER_GRACE seconds
+        if (not pomodoro.state.lastNotificationAcknowledged) and
+           (now - pomodoro.notificationEntered >= BANNER_GRACE) then
+            raiseOverlay()
+        end
+
+    -- OVERLAY simply waits for user dismissal
+    end
 end
 
 -- Save state to persistence
@@ -299,9 +320,15 @@ local function timerCallback()
     -- Calculate elapsed time since last check
     local elapsed = now - pomodoro.state.lastUpdate
     pomodoro.state.lastUpdate = now
+
+    -- Detect long gaps between timer ticks (e.g. system sleep).  After a sleep, the user’s
+    -- first input resets `hs.host.idleTime()` to almost zero, but the time delta between
+    -- successive timer callbacks (`elapsed`) still captures the real pause.  We therefore
+    -- treat whichever is larger as the true idle duration.
+    local effectiveIdle = math.max(idleTime, elapsed)
     
     -- Determine state transition based on idle time
-    if idleTime >= RESET_THRESHOLD then
+    if effectiveIdle >= RESET_THRESHOLD then
         -- User has been idle for 5+ minutes
         if pomodoro.state.currentState ~= STATE.FRESH then
             log.d("Transitioning to FRESH state after", idleTime, "seconds of inactivity")
@@ -310,22 +337,35 @@ local function timerCallback()
             pomodoro.state.idleTime = 0
             pomodoro.state.notifiedAt = {}  -- Reset notifications
             pomodoro.state.lastNotificationAcknowledged = true  -- Reset acknowledgment state
-            
+
+            -- reset notification FSM
+            pomodoro.notificationMode    = NOTIFY_MODE.NONE
+            pomodoro.notificationEntered = nil
+            pomodoro.nextBannerDue       = nil
+            if pomodoro.bannerHandle then
+                notification.dismiss(pomodoro.bannerHandle)
+                pomodoro.bannerHandle = nil
+            end
+            if pomodoro.overlayHandle then
+                notification.dismiss(pomodoro.overlayHandle)
+                pomodoro.overlayHandle = nil
+            end
+
             -- Clean up enhanced notification window if it exists
             if pomodoro.enhancedNotificationElements then
                 notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
                 pomodoro.enhancedNotificationElements = nil
             end
         end
-    elseif idleTime >= IDLE_THRESHOLD then
+    elseif effectiveIdle >= IDLE_THRESHOLD then
         -- User has been idle for 1+ minute but less than 5 minutes
         if pomodoro.state.currentState == STATE.WORK then
-            log.d("Transitioning from WORK to IDLE after", idleTime, "seconds of inactivity")
+            log.d("Transitioning from WORK to IDLE after", effectiveIdle, "seconds of inactivity")
             pomodoro.state.currentState = STATE.IDLE
-            pomodoro.state.idleTime = idleTime  -- Start counting from current idle time
+            pomodoro.state.idleTime = effectiveIdle  -- Account for possible sleep gap
         elseif pomodoro.state.currentState == STATE.IDLE then
             -- Already in idle state, update idle time
-            pomodoro.state.idleTime = idleTime
+            pomodoro.state.idleTime = effectiveIdle
         elseif pomodoro.state.currentState == STATE.FRESH then
             -- Stay in fresh state
         end
@@ -339,19 +379,32 @@ local function timerCallback()
             pomodoro.state.idleTime = 0
             pomodoro.state.notifiedAt = {}  -- Reset notifications
             pomodoro.state.lastNotificationAcknowledged = true  -- Reset acknowledgment state
-            
+
+            -- reset notification FSM
+            pomodoro.notificationMode    = NOTIFY_MODE.NONE
+            pomodoro.notificationEntered = nil
+            pomodoro.nextBannerDue       = nil
+            if pomodoro.bannerHandle then
+                notification.dismiss(pomodoro.bannerHandle)
+                pomodoro.bannerHandle = nil
+            end
+            if pomodoro.overlayHandle then
+                notification.dismiss(pomodoro.overlayHandle)
+                pomodoro.overlayHandle = nil
+            end
+
             -- Clean up enhanced notification window if it exists
             if pomodoro.enhancedNotificationElements then
                 notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
                 pomodoro.enhancedNotificationElements = nil
             end
         elseif pomodoro.state.currentState == STATE.WORK then
-            -- Already in work state, increment work time
-            pomodoro.state.workTime = pomodoro.state.workTime + elapsed
-            
-            -- Check if time to send notification
-            if pomodoro.state.workTime >= WORK_NOTIFICATION_TIME then
-                checkNotifications()  -- Check if we need to send notifications
+            -- Already in work state. Ignore any gap that would have been classified as idle
+            -- (e.g. queued timer ticks after system sleep).
+            if effectiveIdle < IDLE_THRESHOLD then
+                pomodoro.state.workTime = pomodoro.state.workTime + elapsed
+                -- Invoke notification state‑machine tick only when work time advanced
+                updateNotifications(now)
             end
         end
     end
@@ -439,10 +492,7 @@ function pomodoro.stop()
         pomodoro.bannerHandle = nil
     end
 
-    if pomodoro.repeatTimer then
-        pomodoro.repeatTimer:stop()
-        pomodoro.repeatTimer = nil
-    end
+    -- (repeatTimer removal: nothing to do)
     
     -- Save state before stopping
     saveState()
