@@ -321,21 +321,20 @@ local function timerCallback()
     local elapsed = now - pomodoro.state.lastUpdate
     pomodoro.state.lastUpdate = now
 
-    -- Detect long gaps between timer ticks (e.g. system sleep).  After a sleep, the user’s
-    -- first input resets `hs.host.idleTime()` to almost zero, but the time delta between
-    -- successive timer callbacks (`elapsed`) still captures the real pause.  We therefore
-    -- treat whichever is larger as the true idle duration.
-    local effectiveIdle = math.max(idleTime, elapsed)
+    -- Distinguish ordinary HID idle from long gaps where the timer itself paused
+    local sleepGap = elapsed - idleTime                 -- ≥ 1 s → mac slept / Hammerspoon stalled
+    local effectiveIdle        = idleTime               -- for 2‑minute IDLE threshold
+    local effectiveIdleForReset = (sleepGap > 1) and elapsed or idleTime  -- for 5‑minute FRESH reset
     
     -- Determine state transition based on idle time
-    if effectiveIdle >= RESET_THRESHOLD then
+    if effectiveIdleForReset >= RESET_THRESHOLD then
         -- User has been idle for 5+ minutes
         if pomodoro.state.currentState ~= STATE.FRESH then
-            log.d("Transitioning to FRESH state after", idleTime, "seconds of inactivity")
+            log.d("Transitioning to FRESH state after", effectiveIdleForReset, "seconds of inactivity")
             pomodoro.state.currentState = STATE.FRESH
             pomodoro.state.workTime = 0
             pomodoro.state.idleTime = 0
-            pomodoro.state.notifiedAt = {}  -- Reset notifications
+            pomodoro.state.notifiedAt = {}  
             pomodoro.state.lastNotificationAcknowledged = true  -- Reset acknowledgment state
 
             -- reset notification FSM
@@ -370,49 +369,54 @@ local function timerCallback()
             -- Stay in fresh state
         end
     else
-        -- Transition back to WORK
-        if pomodoro.state.currentState == STATE.FRESH then
-            -- Starting a brand‑new Pomodoro session
-            log.d("Transitioning to WORK state from FRESH")
-            pomodoro.state.currentState = STATE.WORK
-            pomodoro.state.workTime = 0      -- start fresh
-            pomodoro.state.notifiedAt = {}   -- clear past notifications
-        elseif pomodoro.state.currentState == STATE.IDLE then
-            -- Resume the ongoing Pomodoro without resetting the timer
-            log.d("Resuming WORK state from IDLE (preserve workTime)")
-            pomodoro.state.currentState = STATE.WORK
-            -- keep pomodoro.state.workTime unchanged
-        end
-        -- Common reset operations for both transitions
-        pomodoro.state.idleTime = 0
-        pomodoro.state.lastNotificationAcknowledged = true
+        ----------------------------------------------------------------------
+        --  User is active again  (effectiveIdle < IDLE_THRESHOLD)
+        ----------------------------------------------------------------------
+        if pomodoro.state.currentState == STATE.WORK then
+            ------------------------------------------------------------------
+            -- Still in WORK: just keep counting seconds
+            ------------------------------------------------------------------
+            pomodoro.state.workTime = pomodoro.state.workTime + elapsed
+            -- Tick the notification FSM only when workTime advanced
+            updateNotifications(now)
 
-            -- reset notification FSM
+        elseif pomodoro.state.currentState == STATE.FRESH then
+            ------------------------------------------------------------------
+            -- First keystroke after a long break → start a brand‑new session
+            ------------------------------------------------------------------
+            log.d("Transitioning to WORK state from FRESH (workTime currently =",
+                  pomodoro.state.workTime, "s)")
+            pomodoro.state.currentState = STATE.WORK
+
+            -- Shared housekeeping
+            pomodoro.state.idleTime                 = 0
+            pomodoro.state.lastNotificationAcknowledged = true
+
             pomodoro.notificationMode    = NOTIFY_MODE.NONE
             pomodoro.notificationEntered = nil
             pomodoro.nextBannerDue       = nil
-            if pomodoro.bannerHandle then
-                notification.dismiss(pomodoro.bannerHandle)
-                pomodoro.bannerHandle = nil
-            end
-            if pomodoro.overlayHandle then
-                notification.dismiss(pomodoro.overlayHandle)
-                pomodoro.overlayHandle = nil
-            end
 
-            -- Clean up enhanced notification window if it exists
-            if pomodoro.enhancedNotificationElements then
-                notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
-                pomodoro.enhancedNotificationElements = nil
-            end
-        elseif pomodoro.state.currentState == STATE.WORK then
-            -- Already in work state. Ignore any gap that would have been classified as idle
-            -- (e.g. queued timer ticks after system sleep).
-            if effectiveIdle < IDLE_THRESHOLD then
-                pomodoro.state.workTime = pomodoro.state.workTime + elapsed
-                -- Invoke notification state‑machine tick only when work time advanced
-                updateNotifications(now)
-            end
+            if pomodoro.bannerHandle  then notification.dismiss(pomodoro.bannerHandle)  ; pomodoro.bannerHandle  = nil end
+            if pomodoro.overlayHandle then notification.dismiss(pomodoro.overlayHandle) ; pomodoro.overlayHandle = nil end
+
+        elseif pomodoro.state.currentState == STATE.IDLE then
+            ------------------------------------------------------------------
+            -- Coming back from a short idle (< 5 min) → resume the session
+            ------------------------------------------------------------------
+            log.d("Resuming WORK state from IDLE (preserve workTime =",
+                  pomodoro.state.workTime, "s)")
+            pomodoro.state.currentState = STATE.WORK
+
+            -- Shared housekeeping (note: we *preserve* workTime)
+            pomodoro.state.idleTime                 = 0
+            pomodoro.state.lastNotificationAcknowledged = true
+
+            pomodoro.notificationMode    = NOTIFY_MODE.NONE
+            pomodoro.notificationEntered = nil
+            pomodoro.nextBannerDue       = nil
+
+            if pomodoro.bannerHandle  then notification.dismiss(pomodoro.bannerHandle)  ; pomodoro.bannerHandle  = nil end
+            if pomodoro.overlayHandle then notification.dismiss(pomodoro.overlayHandle) ; pomodoro.overlayHandle = nil end
         end
     end
     
