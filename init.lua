@@ -370,15 +370,22 @@ local function timerCallback()
             -- Stay in fresh state
         end
     else
-        -- User is active
-        if pomodoro.state.currentState == STATE.FRESH or 
-           pomodoro.state.currentState == STATE.IDLE then
-            log.d("Transitioning to WORK state from", pomodoro.state.currentState)
+        -- Transition back to WORK
+        if pomodoro.state.currentState == STATE.FRESH then
+            -- Starting a brand‑new Pomodoro session
+            log.d("Transitioning to WORK state from FRESH")
             pomodoro.state.currentState = STATE.WORK
-            pomodoro.state.workTime = 0  -- Reset work timer when coming from FRESH or IDLE
-            pomodoro.state.idleTime = 0
-            pomodoro.state.notifiedAt = {}  -- Reset notifications
-            pomodoro.state.lastNotificationAcknowledged = true  -- Reset acknowledgment state
+            pomodoro.state.workTime = 0      -- start fresh
+            pomodoro.state.notifiedAt = {}   -- clear past notifications
+        elseif pomodoro.state.currentState == STATE.IDLE then
+            -- Resume the ongoing Pomodoro without resetting the timer
+            log.d("Resuming WORK state from IDLE (preserve workTime)")
+            pomodoro.state.currentState = STATE.WORK
+            -- keep pomodoro.state.workTime unchanged
+        end
+        -- Common reset operations for both transitions
+        pomodoro.state.idleTime = 0
+        pomodoro.state.lastNotificationAcknowledged = true
 
             -- reset notification FSM
             pomodoro.notificationMode    = NOTIFY_MODE.NONE
