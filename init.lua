@@ -30,6 +30,37 @@ local NOTIFY_MODE = {
     OVERLAY = "overlay"
 }
 
+-- ------------------------------------------------------------------
+--  Helper: transition to FRESH and clear all runtime artefacts
+-- ------------------------------------------------------------------
+local function enterFresh(reason)
+    log.d("Transitioning to FRESH (" .. (reason or "n/a") .. ")")
+    pomodoro.state.currentState = STATE.FRESH
+    pomodoro.state.workTime     = 0
+    pomodoro.state.idleTime     = 0
+    pomodoro.state.notifiedAt   = {}
+    pomodoro.state.lastNotificationAcknowledged = true
+
+    -- Reset notification FSM
+    pomodoro.notificationMode    = NOTIFY_MODE.NONE
+    pomodoro.notificationEntered = nil
+    pomodoro.nextBannerDue       = nil
+
+    -- Dismiss any outstanding UI handles
+    if notification.resetRuntimeHandles then
+        notification.resetRuntimeHandles(pomodoro)
+    else
+        if pomodoro.bannerHandle  then notification.dismiss(pomodoro.bannerHandle)  ; pomodoro.bannerHandle  = nil end
+        if pomodoro.overlayHandle then notification.dismiss(pomodoro.overlayHandle) ; pomodoro.overlayHandle = nil end
+    end
+
+    -- Clean up enhanced notification window if it exists
+    if pomodoro.enhancedNotificationElements then
+        notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
+        pomodoro.enhancedNotificationElements = nil
+    end
+end
+
 -- State variables
 pomodoro.state = {
     currentState = STATE.FRESH,
@@ -251,17 +282,7 @@ local function loadState()
         -- If we've been away for more than the reset threshold, reset to fresh
         if timeSinceLastUpdate > RESET_THRESHOLD then
             log.d("More than reset threshold has passed, resetting to fresh state")
-            pomodoro.state.currentState = STATE.FRESH
-            pomodoro.state.workTime = 0
-            pomodoro.state.idleTime = 0
-            pomodoro.state.notifiedAt = {}
-            pomodoro.state.lastNotificationAcknowledged = true
-            
-            -- Clean up enhanced notification window if it exists
-            if pomodoro.enhancedNotificationElements then
-                notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
-                pomodoro.enhancedNotificationElements = nil
-            end
+            enterFresh("resume‑timeout")
         else
             -- Restore saved state
             pomodoro.state.currentState = savedState.currentState
@@ -294,16 +315,7 @@ local function loadState()
                 
                 -- Check if we've been idle long enough to reset to fresh
                 if pomodoro.state.idleTime >= RESET_THRESHOLD then
-                    pomodoro.state.currentState = STATE.FRESH
-                    pomodoro.state.workTime = 0
-                    pomodoro.state.idleTime = 0
-                    pomodoro.state.notifiedAt = {}
-                    
-                    -- Clean up enhanced notification window if it exists
-                    if pomodoro.enhancedNotificationElements then
-                        notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
-                        pomodoro.enhancedNotificationElements = nil
-                    end
+                    enterFresh("resume‑timeout")
                 end
             end
         end
@@ -315,46 +327,24 @@ end
 -- Timer callback function
 local function timerCallback()
     local now = os.time()
+    local prevState = pomodoro.state.currentState
     local idleTime = hs.host.idleTime()
     
     -- Calculate elapsed time since last check
     local elapsed = now - pomodoro.state.lastUpdate
     pomodoro.state.lastUpdate = now
 
-    -- Distinguish ordinary HID idle from long gaps where the timer itself paused
-    local sleepGap = elapsed - idleTime                 -- ≥ 1 s → mac slept / Hammerspoon stalled
+    -- Detect genuine sleep or long Lua stall (≥ 3× the tick interval)
+    local sleepGap = elapsed - idleTime
+    local longPause = sleepGap > CHECK_INTERVAL * 3
     local effectiveIdle        = idleTime               -- for 2‑minute IDLE threshold
-    local effectiveIdleForReset = (sleepGap > 1) and elapsed or idleTime  -- for 5‑minute FRESH reset
+    local effectiveIdleForReset = longPause and elapsed or idleTime  -- for 5‑minute FRESH reset
     
     -- Determine state transition based on idle time
     if effectiveIdleForReset >= RESET_THRESHOLD then
         -- User has been idle for 5+ minutes
         if pomodoro.state.currentState ~= STATE.FRESH then
-            log.d("Transitioning to FRESH state after", effectiveIdleForReset, "seconds of inactivity")
-            pomodoro.state.currentState = STATE.FRESH
-            pomodoro.state.workTime = 0
-            pomodoro.state.idleTime = 0
-            pomodoro.state.notifiedAt = {}  
-            pomodoro.state.lastNotificationAcknowledged = true  -- Reset acknowledgment state
-
-            -- reset notification FSM
-            pomodoro.notificationMode    = NOTIFY_MODE.NONE
-            pomodoro.notificationEntered = nil
-            pomodoro.nextBannerDue       = nil
-            if pomodoro.bannerHandle then
-                notification.dismiss(pomodoro.bannerHandle)
-                pomodoro.bannerHandle = nil
-            end
-            if pomodoro.overlayHandle then
-                notification.dismiss(pomodoro.overlayHandle)
-                pomodoro.overlayHandle = nil
-            end
-
-            -- Clean up enhanced notification window if it exists
-            if pomodoro.enhancedNotificationElements then
-                notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
-                pomodoro.enhancedNotificationElements = nil
-            end
+            enterFresh("idle‑timeout (" .. effectiveIdleForReset .. " s)")
         end
     elseif effectiveIdle >= IDLE_THRESHOLD then
         -- User has been idle for 1+ minute but less than 5 minutes
@@ -423,8 +413,16 @@ local function timerCallback()
     -- Update menu bar
     updateMenuBar()
     
-    -- Save state
-    saveState()
+    ------------------------------------------------------------------
+    --  Persist only when useful
+    ------------------------------------------------------------------
+    local stateChanged = (prevState ~= pomodoro.state.currentState)
+    local crossedMinute = (pomodoro.state.currentState == STATE.WORK) and
+                          (pomodoro.state.workTime % 60 == 0) and
+                          (elapsed > 0)
+    if stateChanged or crossedMinute then
+        saveState()
+    end
 end
 
 -- Initialize the pomodoro timer
@@ -444,18 +442,7 @@ function pomodoro.init()
             
             return {
                 { title = "Reset Timer", fn = function()
-                    pomodoro.state.currentState = STATE.FRESH
-                    pomodoro.state.workTime = 0
-                    pomodoro.state.idleTime = 0
-                    pomodoro.state.notifiedAt = {}
-                    pomodoro.state.lastNotificationAcknowledged = true
-                    
-                    -- Clean up enhanced notification window if it exists
-                    if pomodoro.enhancedNotificationElements then
-                        notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
-                        pomodoro.enhancedNotificationElements = nil
-                    end
-                    
+                    enterFresh("manual‑reset")
                     updateMenuBar()
                     saveState()
                     hs.alert.show("Timer reset")
