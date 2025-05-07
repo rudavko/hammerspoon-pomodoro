@@ -60,4 +60,13 @@ function M.dismiss(h)
   if h.canvases then for _,c in ipairs(h.canvases) do pcall(function() c:delete() end) end
   elseif h.withdraw then pcall(function() h:withdraw() end) end
 end
+--------------------------------------------------------------------
+--  Runtime‑handle bulk reset
+--------------------------------------------------------------------
+function M.resetRuntimeHandles(p)
+  if not p then return end
+  if p.bannerHandle  then M.dismiss(p.bannerHandle)  ; p.bannerHandle  = nil end
+  if p.overlayHandle then M.dismiss(p.overlayHandle) ; p.overlayHandle = nil end
+end
+
 return M

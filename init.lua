@@ -78,8 +78,6 @@ pomodoro.menuBar = nil
 pomodoro.timer = nil
 pomodoro.bannerHandle  = nil
 pomodoro.overlayHandle = nil
-pomodoro.bannerSentAt  = nil
-
 -- Notification‑FSM runtime fields
 pomodoro.notificationMode    = NOTIFY_MODE.NONE   -- current view‑state
 pomodoro.notificationEntered = nil                -- os.time() when mode entered
@@ -91,85 +89,29 @@ pomodoro.enhancedNotificationElements = nil
 -- Initialize the notification module with references to pomodoro and logger
 notification.init(log)
 
--- Format time for display
-local function formatTime(state, seconds)
-    if state == STATE.WORK then
-        if seconds < 60 then
-            return string.format("work %ds", seconds)
-        else
-            return string.format("work: %dm", math.floor(seconds / 60))
-        end
-    elseif state == STATE.IDLE then
-        if seconds < 60 then
-            return string.format("idle %ds", seconds)
-        else
-            return string.format("idle: %dm", math.floor(seconds / 60))
-        end
-    elseif state == STATE.FRESH then
-        return "fresh"
-    end
-    return "unknown"  -- Should never happen
+
+-- Pure formatter for menu‑bar and status strings
+local function formatMenu(state, work, idle)
+    if state == STATE.FRESH then return "fresh" end
+    local secs = (state == STATE.WORK) and work or idle
+    local unit = secs < 60 and "s" or "m"
+    local n    = secs < 60 and secs or math.floor(secs / 60)
+    return string.format("%s %d%s", state, n, unit)
 end
 
--- Helper function to convert table to string for debugging
-local function tableToString(t)
-    if not t then return "nil" end
-    
-    local result = "{}"
-    local count = 0
-    for k, v in pairs(t) do
-        count = count + 1
-        if count <= 3 then
-            if count == 1 then
-                result = "{ "
-            else
-                result = result .. ", "
-            end
-            result = result .. tostring(k) .. ": " .. tostring(v)
-        end
-    end
-    
-    if count > 3 then
-        result = result .. ", ... (" .. count .. " items)"
-    end
-    
-    if count > 0 then
-        result = result .. " }"
-    end
-    
-    return result
-end
-
--- Update menu bar display
 local function updateMenuBar()
-    if pomodoro.menuBar then
-        local formattedTime
-        if pomodoro.state.currentState == STATE.WORK then
-            formattedTime = formatTime(STATE.WORK, pomodoro.state.workTime)
-        elseif pomodoro.state.currentState == STATE.IDLE then
-            formattedTime = formatTime(STATE.IDLE, pomodoro.state.idleTime)
-        else
-            formattedTime = formatTime(STATE.FRESH, 0)
-        end
-        pomodoro.menuBar:setTitle(formattedTime)
-        
-        -- Set click callback for the menubar item itself (not the dropdown menu)
-        pomodoro.menuBar:setClickCallback(function()
-            local minutes = math.floor(pomodoro.state.workTime / 60)
-            local seconds = pomodoro.state.workTime % 60
-            local stateInfo = string.format(
-                "State: %s\nWork time: %d min %d sec\nIdle time: %d sec\nNotifications: %s\nLast notification acknowledged: %s", 
-                pomodoro.state.currentState,
-                minutes,
-                seconds,
-                pomodoro.state.idleTime,
-                tableToString(pomodoro.state.notifiedAt),
-                pomodoro.state.lastNotificationAcknowledged and "Yes" or "No"
-            )
-            hs.alert.show(stateInfo, 5)
-            return false  -- Return false to still show menu on right-click
-        end)
-    end
+    if not pomodoro.menuBar then return end
+
+    local title = formatMenu(pomodoro.state.currentState,
+                             pomodoro.state.workTime,
+                             pomodoro.state.idleTime)
+    pomodoro.menuBar:setTitle(title)
+
+    pomodoro.menuBar:setClickCallback(function()
+        local info = hs.inspect(pomodoro.state):sub(1, 300)
+        hs.alert.show(info, 5)
+        return false
+    end)
 end
 
 -- Send a notification
@@ -178,107 +120,102 @@ local function sendNotification(duration)
 end
 
 
-function raiseBanner()
-    -- draw banner
-    pomodoro.bannerHandle = notification.showBanner(
-        math.floor(pomodoro.state.workTime / 60),
-        function()  -- onClick
-            -- user acknowledged
-            pomodoro.state.lastNotificationAcknowledged = true
-            if pomodoro.bannerHandle then
-                notification.dismiss(pomodoro.bannerHandle)
-                pomodoro.bannerHandle = nil
-            end
-            pomodoro.notificationMode    = NOTIFY_MODE.NONE
-            pomodoro.notificationEntered = nil
-            pomodoro.nextBannerDue       = os.time() + REPEAT_INTERVAL
-        end)
 
-    pomodoro.notificationMode    = NOTIFY_MODE.BANNER
-    pomodoro.notificationEntered = os.time()
-    pomodoro.state.lastNotificationAcknowledged = false
-end
+-- Alert kinds configuration ---------------------------------------
+local ALERT = {
+  banner  = { kind = NOTIFY_MODE.BANNER,
+              build = function(minutes, onAck)
+                  return notification.showBanner(minutes, onAck)
+              end,
+              grace = BANNER_GRACE },
+  overlay = { kind = NOTIFY_MODE.OVERLAY,
+              build = function(minutes, onAck)
+                  return notification.showOverlay(minutes, onAck)
+              end,
+              grace = math.huge }           -- never auto‑escalate
+}
 
-local function raiseOverlay()
-    -- hide banner if still present
-    if pomodoro.bannerHandle then
-        notification.dismiss(pomodoro.bannerHandle)
-        pomodoro.bannerHandle = nil
-    end
+-- Generic alert raiser --------------------------------------------
+local function raiseAlert(which, minutes)
+  local cfg = ALERT[which]
+  if not cfg then return end
 
-    pomodoro.overlayHandle = notification.showOverlay(
-        math.floor(pomodoro.state.workTime / 60),
-        function()  -- onDismiss
-            pomodoro.state.lastNotificationAcknowledged = true
-            if pomodoro.overlayHandle then
-                notification.dismiss(pomodoro.overlayHandle)
-                pomodoro.overlayHandle = nil
-            end
-            pomodoro.notificationMode    = NOTIFY_MODE.NONE
-            pomodoro.notificationEntered = nil
-            pomodoro.nextBannerDue       = os.time() + REPEAT_INTERVAL
-        end)
+  -- dismiss any existing UI
+  if notification.resetRuntimeHandles then
+      notification.resetRuntimeHandles(pomodoro)
+  else
+      if pomodoro.bannerHandle  then notification.dismiss(pomodoro.bannerHandle)  ; pomodoro.bannerHandle  = nil end
+      if pomodoro.overlayHandle then notification.dismiss(pomodoro.overlayHandle) ; pomodoro.overlayHandle = nil end
+  end
 
-    pomodoro.notificationMode    = NOTIFY_MODE.OVERLAY
-    pomodoro.notificationEntered = os.time()
+  local h = cfg.build(minutes, function()  -- on acknowledge/dismiss
+      pomodoro.state.lastNotificationAcknowledged = true
+      if notification.resetRuntimeHandles then
+          notification.resetRuntimeHandles(pomodoro)
+      else
+          if pomodoro.bannerHandle  then notification.dismiss(pomodoro.bannerHandle)  ; pomodoro.bannerHandle  = nil end
+          if pomodoro.overlayHandle then notification.dismiss(pomodoro.overlayHandle) ; pomodoro.overlayHandle = nil end
+      end
+      pomodoro.notificationMode    = NOTIFY_MODE.NONE
+      pomodoro.notificationEntered = nil
+      pomodoro.nextBannerDue       = os.time() + REPEAT_INTERVAL
+  end)
+
+  if cfg.kind == NOTIFY_MODE.BANNER then
+      pomodoro.bannerHandle = h
+  else
+      pomodoro.overlayHandle = h
+  end
+
+  pomodoro.notificationMode    = cfg.kind
+  pomodoro.notificationEntered = os.time()
+  pomodoro.state.lastNotificationAcknowledged = false
 end
 
 local function updateNotifications(now)
     -- guard: only operate in WORK state
     if pomodoro.state.currentState ~= STATE.WORK then return end
 
-    -- state machine
+    local workSec = pomodoro.state.workTime
+
     if pomodoro.notificationMode == NOTIFY_MODE.NONE then
-        -- First banner at 25 min or a repeat banner when due
-        if (pomodoro.state.workTime >= WORK_NOTIFICATION_TIME) and
+        if (workSec >= WORK_NOTIFICATION_TIME) and
            (pomodoro.nextBannerDue == nil or now >= pomodoro.nextBannerDue) then
-            raiseBanner()
+            raiseAlert("banner", math.floor(workSec / 60))
         end
 
     elseif pomodoro.notificationMode == NOTIFY_MODE.BANNER then
-        -- Escalate if unacknowledged for BANNER_GRACE seconds
         if (not pomodoro.state.lastNotificationAcknowledged) and
-           (now - pomodoro.notificationEntered >= BANNER_GRACE) then
-            raiseOverlay()
+           (now - pomodoro.notificationEntered >= ALERT.banner.grace) then
+            raiseAlert("overlay", math.floor(workSec / 60))
         end
-
-    -- OVERLAY simply waits for user dismissal
     end
 end
 
--- Save state to persistence
 local function saveState()
-    -- Convert notifiedAt table to use numeric values instead of booleans
-    local notifiedAtSave = {}
-    for k, v in pairs(pomodoro.state.notifiedAt) do
-        notifiedAtSave[tostring(k)] = 1  -- Use 1 instead of true
-    end
-    
     local stateToSave = {
         currentState = pomodoro.state.currentState,
         workTime = pomodoro.state.workTime,
         idleTime = pomodoro.state.idleTime,
-        lastUpdate = os.time(),  -- Always save current time as last update
-        notifiedAt = notifiedAtSave,  -- Save notification history with numeric values
-        lastNotificationAcknowledged = pomodoro.state.lastNotificationAcknowledged  -- Save acknowledgment state
+        lastUpdate = os.time(),
+        notifiedAt = pomodoro.state.notifiedAt,
+        lastNotificationAcknowledged = pomodoro.state.lastNotificationAcknowledged
     }
     hs.settings.set(PERSISTENCE_KEY, stateToSave)
-    
-    -- Only log state saves on significant changes (every minute of work)
+
     if pomodoro.state.currentState == STATE.WORK and pomodoro.state.workTime % 60 == 0 then
-        log.d("State saved, current workTime:", stateToSave.workTime, "seconds")
+        log.d("State saved at", stateToSave.workTime, "seconds")
     end
 end
 
--- Load state from persistence
 local function loadState()
     local savedState = hs.settings.get(PERSISTENCE_KEY)
     if savedState then
         local now = os.time()
         local timeSinceLastUpdate = now - savedState.lastUpdate
-        
+
         log.d("Loaded saved state from", savedState.lastUpdate, "time elapsed:", timeSinceLastUpdate)
-        
+
         -- If we've been away for more than the reset threshold, reset to fresh
         if timeSinceLastUpdate > RESET_THRESHOLD then
             log.d("More than reset threshold has passed, resetting to fresh state")
@@ -288,43 +225,38 @@ local function loadState()
             pomodoro.state.currentState = savedState.currentState
             pomodoro.state.workTime = savedState.workTime
             pomodoro.state.idleTime = savedState.idleTime
-            
+
             -- Restore acknowledgment state, defaulting to true if not present (for backward compatibility)
             pomodoro.state.lastNotificationAcknowledged = savedState.lastNotificationAcknowledged
             if pomodoro.state.lastNotificationAcknowledged == nil then
                 pomodoro.state.lastNotificationAcknowledged = true
             end
-            
-            -- Convert numeric notifiedAt values back to booleans
-            pomodoro.state.notifiedAt = {}
-            if savedState.notifiedAt then
-                for k, v in pairs(savedState.notifiedAt) do
-                    -- Convert string keys back to numbers when appropriate
-                    local key = k
-                    if tonumber(k) then key = tonumber(k) end
-                    pomodoro.state.notifiedAt[key] = true
-                end
-            end
-            
+
+            pomodoro.state.notifiedAt = savedState.notifiedAt or {}
+
             -- If we were working before, add the time we were away (if it was less than idle threshold)
             if pomodoro.state.currentState == STATE.WORK and timeSinceLastUpdate < IDLE_THRESHOLD then
                 pomodoro.state.workTime = pomodoro.state.workTime + timeSinceLastUpdate
             -- If we were idling before, add the time we were away
             elseif pomodoro.state.currentState == STATE.IDLE then
                 pomodoro.state.idleTime = pomodoro.state.idleTime + timeSinceLastUpdate
-                
+
                 -- Check if we've been idle long enough to reset to fresh
                 if pomodoro.state.idleTime >= RESET_THRESHOLD then
                     enterFresh("resume‑timeout")
                 end
             end
         end
-        
+
         pomodoro.state.lastUpdate = now
     end
 end
 
--- Timer callback function
+------------------------------------------------------------------
+--  Forward‑declare transition helpers so they’re in scope earlier
+------------------------------------------------------------------
+local enterWork, enterIdle
+
 local function timerCallback()
     local now = os.time()
     local prevState = pomodoro.state.currentState
@@ -359,54 +291,14 @@ local function timerCallback()
             -- Stay in fresh state
         end
     else
-        ----------------------------------------------------------------------
-        --  User is active again  (effectiveIdle < IDLE_THRESHOLD)
-        ----------------------------------------------------------------------
+        -- User is active again (effectiveIdle < IDLE_THRESHOLD)
         if pomodoro.state.currentState == STATE.WORK then
-            ------------------------------------------------------------------
-            -- Still in WORK: just keep counting seconds
-            ------------------------------------------------------------------
             pomodoro.state.workTime = pomodoro.state.workTime + elapsed
-            -- Tick the notification FSM only when workTime advanced
             updateNotifications(now)
-
         elseif pomodoro.state.currentState == STATE.FRESH then
-            ------------------------------------------------------------------
-            -- First keystroke after a long break → start a brand‑new session
-            ------------------------------------------------------------------
-            log.d("Transitioning to WORK state from FRESH (workTime currently =",
-                  pomodoro.state.workTime, "s)")
-            pomodoro.state.currentState = STATE.WORK
-
-            -- Shared housekeeping
-            pomodoro.state.idleTime                 = 0
-            pomodoro.state.lastNotificationAcknowledged = true
-
-            pomodoro.notificationMode    = NOTIFY_MODE.NONE
-            pomodoro.notificationEntered = nil
-            pomodoro.nextBannerDue       = nil
-
-            if pomodoro.bannerHandle  then notification.dismiss(pomodoro.bannerHandle)  ; pomodoro.bannerHandle  = nil end
-            if pomodoro.overlayHandle then notification.dismiss(pomodoro.overlayHandle) ; pomodoro.overlayHandle = nil end
-
+            enterWork(false)   -- start a brand‑new session
         elseif pomodoro.state.currentState == STATE.IDLE then
-            ------------------------------------------------------------------
-            -- Coming back from a short idle (< 5 min) → resume the session
-            ------------------------------------------------------------------
-            log.d("Resuming WORK state from IDLE (preserve workTime =",
-                  pomodoro.state.workTime, "s)")
-            pomodoro.state.currentState = STATE.WORK
-
-            -- Shared housekeeping (note: we *preserve* workTime)
-            pomodoro.state.idleTime                 = 0
-            pomodoro.state.lastNotificationAcknowledged = true
-
-            pomodoro.notificationMode    = NOTIFY_MODE.NONE
-            pomodoro.notificationEntered = nil
-            pomodoro.nextBannerDue       = nil
-
-            if pomodoro.bannerHandle  then notification.dismiss(pomodoro.bannerHandle)  ; pomodoro.bannerHandle  = nil end
-            if pomodoro.overlayHandle then notification.dismiss(pomodoro.overlayHandle) ; pomodoro.overlayHandle = nil end
+            enterWork(true)    -- resume existing session
         end
     end
     
@@ -425,21 +317,34 @@ local function timerCallback()
     end
 end
 
--- Initialize the pomodoro timer
+------------------------------------------------------------------
+--  State helpers for transitions
+------------------------------------------------------------------
+enterWork = function(resumed)
+    pomodoro.state.currentState = STATE.WORK
+    if not resumed then pomodoro.state.workTime = 0 end
+    pomodoro.state.idleTime = 0
+    pomodoro.state.lastNotificationAcknowledged = true
+    pomodoro.notificationMode    = NOTIFY_MODE.NONE
+    pomodoro.notificationEntered = nil
+    pomodoro.nextBannerDue       = nil
+    if notification.resetRuntimeHandles then
+        notification.resetRuntimeHandles(pomodoro)
+    end
+end
+
+enterIdle = function(sec)
+    pomodoro.state.currentState, pomodoro.state.idleTime = STATE.IDLE, sec
+end
+
 function pomodoro.init()
     -- Create menu bar item
     pomodoro.menuBar = hs.menubar.new()
     if pomodoro.menuBar then
         updateMenuBar()
-        
+
         -- Add menu options
         pomodoro.menuBar:setMenu(function()
-            -- Get real-time values every time the menu is opened
-            local workMinutes = math.floor(pomodoro.state.workTime / 60)
-            local workSeconds = pomodoro.state.workTime % 60
-            local idleMinutes = math.floor(pomodoro.state.idleTime / 60)
-            local idleSeconds = pomodoro.state.idleTime % 60
-            
             return {
                 { title = "Reset Timer", fn = function()
                     enterFresh("manual‑reset")
@@ -448,9 +353,10 @@ function pomodoro.init()
                     hs.alert.show("Timer reset")
                 end },
                 { title = "-" },  -- Separator
-                { title = string.format("Time Working: %02d:%02d", workMinutes, workSeconds), disabled = true },
-                { title = string.format("Idle Time: %02d:%02d", idleMinutes, idleSeconds), disabled = true },
-                { title = string.format("Current State: %s", pomodoro.state.currentState), disabled = true },
+                { title = "Current: "..formatMenu(pomodoro.state.currentState,
+                                                  pomodoro.state.workTime,
+                                                  pomodoro.state.idleTime), disabled = true },
+                { title = string.format("Idle Time: %02d:%02d", math.floor(pomodoro.state.idleTime / 60), pomodoro.state.idleTime % 60), disabled = true },
                 { title = string.format("Notification at: %d-%d minutes", WORK_NOTIFICATION_TIME / 60, MAX_NOTIFICATION_TIME / 60), disabled = true },
                 { title = string.format("Last notification acknowledged: %s", pomodoro.state.lastNotificationAcknowledged and "Yes" or "No"), disabled = true }
             }
@@ -498,5 +404,7 @@ function pomodoro.stop()
     log.d("Pomodoro timer stopped")
 end
 
--- Start the module
+------------------------------------------------------------------
+--  Module entry‑point
+------------------------------------------------------------------
 return pomodoro.init()
