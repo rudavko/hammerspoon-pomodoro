@@ -1,6 +1,4 @@
--- Pomodoro timer module for Hammerspoon (simplified)
-local log                             = hs.logger.new('pomodoro', 'info')
-
+-- Pomodoro timer module for Hammerspoon (no logging)
 local pomodoro                        = {}
 local notification                    = require('pomodoro.notification')
 
@@ -36,7 +34,8 @@ pomodoro.nextBannerDue                = nil
 
 pomodoro.enhancedNotificationElements = nil
 
-notification.init(log)
+-- Optional no-op init (keeps API parity with notification.lua)
+if notification.init then notification.init() end
 
 -- ---- Small helpers ----------------------------------------------
 local function formatMenu(state, work, idle)
@@ -78,8 +77,7 @@ local function resetAlertState(ack)
 end
 
 -- ---- State transitions ------------------------------------------
-local function enterFresh(reason)
-    log.d("Transitioning to FRESH (" .. (reason or "n/a") .. ")")
+local function enterFresh(_reason)
     pomodoro.state.currentState = STATE.FRESH
     pomodoro.state.workTime     = 0
     pomodoro.state.idleTime     = 0
@@ -109,7 +107,7 @@ local ALERT = {
     },
     overlay = {
         kind  = NOTIFY_MODE.OVERLAY,
-        grace = math.huge,
+        grace = math.huge, -- never auto-escalate beyond overlay
         build = function(minutes, onAck) return notification.showOverlay(minutes, onAck) end
     }
 }
@@ -162,9 +160,6 @@ local function saveState()
         lastUpdate                   = os.time(),
         lastNotificationAcknowledged = pomodoro.state.lastNotificationAcknowledged
     })
-    if pomodoro.state.currentState == STATE.WORK and pomodoro.state.workTime % 60 == 0 then
-        log.d("State saved at", pomodoro.state.workTime, "seconds")
-    end
 end
 
 local function loadState()
@@ -173,8 +168,6 @@ local function loadState()
 
     local now = os.time()
     local dt  = now - (saved.lastUpdate or now)
-
-    log.d("Loaded saved state from", saved.lastUpdate, "elapsed:", dt)
 
     if dt > RESET_THRESHOLD then
         enterFresh("resume-timeout")
@@ -206,16 +199,15 @@ local function timerCallback()
     local elapsed             = now - pomodoro.state.lastUpdate
     pomodoro.state.lastUpdate = now
 
-    -- Handle sleep/long stall: if timer stalled >> CHECK_INTERVAL, treat full gap as "idle for reset" only
+    -- Treat long timer stalls as "idle for reset" checks
     local sleepGap            = elapsed - idle
     local longPause           = sleepGap > CHECK_INTERVAL * 3
     local idleForReset        = longPause and elapsed or idle
 
     if idleForReset >= RESET_THRESHOLD then
-        if pomodoro.state.currentState ~= STATE.FRESH then enterFresh("idle-timeout (" .. idleForReset .. "s)") end
+        if pomodoro.state.currentState ~= STATE.FRESH then enterFresh("idle-timeout") end
     elseif idle >= IDLE_THRESHOLD then
         if pomodoro.state.currentState == STATE.WORK then
-            log.d("Transition WORK -> IDLE after", idle, "s inactivity")
             enterIdle(idle)
         elseif pomodoro.state.currentState == STATE.IDLE then
             enterIdle(idle)
@@ -225,7 +217,7 @@ local function timerCallback()
             pomodoro.state.workTime = pomodoro.state.workTime + elapsed
             updateNotifications(now)
         elseif pomodoro.state.currentState == STATE.FRESH then
-            enterWork(false) -- brand new session
+            enterWork(false) -- start new session
         elseif pomodoro.state.currentState == STATE.IDLE then
             enterWork(true) -- resume session
         end
@@ -271,7 +263,6 @@ function pomodoro.init()
 
     loadState()
     pomodoro.timer = hs.timer.doEvery(CHECK_INTERVAL, timerCallback)
-    log.d("Pomodoro timer initialized; first alert at", WORK_NOTIFICATION_TIME, "seconds")
     return pomodoro
 end
 
@@ -284,7 +275,6 @@ function pomodoro.stop()
         pomodoro.menuBar:delete(); pomodoro.menuBar = nil
     end
     saveState()
-    log.d("Pomodoro timer stopped")
 end
 
 return pomodoro.init()
