@@ -1,18 +1,50 @@
--- Pomodoro timer module for Hammerspoon (no logging)
-local pomodoro                        = {}
-local notification                    = require('pomodoro.notification')
+-- Pomodoro timer module for Hammerspoon (no logging, timer selector)
+local pomodoro        = {}
+local notification    = require('pomodoro.notification')
 
 -- ---- Constants ---------------------------------------------------
-local WORK_NOTIFICATION_TIME          = 25 * 60 -- 25 minutes
-local IDLE_THRESHOLD                  = 120 -- 2 minutes
-local RESET_THRESHOLD                 = 5 * 60 -- 5 minutes
-local PERSISTENCE_KEY                 = 'pomodoro.state'
-local CHECK_INTERVAL                  = 1 -- seconds
-local BANNER_GRACE                    = 60 -- seconds
-local REPEAT_INTERVAL                 = 120 -- seconds
+local IDLE_THRESHOLD  = 120     -- 2 minutes
+local RESET_THRESHOLD = 5 * 60  -- 5 minutes
+local PERSISTENCE_KEY = 'pomodoro.state'
+local CONFIG_KEY      = 'pomodoro.config'
+local CHECK_INTERVAL  = 1    -- seconds
+local BANNER_GRACE    = 60   -- seconds
+local REPEAT_INTERVAL = 120  -- seconds
 
-local STATE                           = { WORK = 'work', IDLE = 'idle', FRESH = 'fresh' }
-local NOTIFY_MODE                     = { NONE = "none", BANNER = "banner", OVERLAY = "overlay" }
+local STATE           = { WORK = 'work', IDLE = 'idle', FRESH = 'fresh' }
+local NOTIFY_MODE     = { NONE = "none", BANNER = "banner", OVERLAY = "overlay" }
+
+-- ---- Config (persisted) ------------------------------------------
+pomodoro.config       = { workMinutes = 25 } -- default
+
+local function saveConfig()
+    hs.settings.set(CONFIG_KEY, { workMinutes = pomodoro.config.workMinutes })
+end
+
+local function loadConfig()
+    local cfg = hs.settings.get(CONFIG_KEY)
+    if cfg and tonumber(cfg.workMinutes) then
+        local m = tonumber(cfg.workMinutes)
+        -- allow only 25/35/45; fallback to 25 if out of range
+        if m == 25 or m == 35 or m == 45 then
+            pomodoro.config.workMinutes = m
+        else
+            pomodoro.config.workMinutes = 25
+        end
+    end
+end
+
+local function workThresholdSeconds()
+    return (pomodoro.config.workMinutes or 25) * 60
+end
+
+local function setWorkMinutes(m)
+    if pomodoro.config.workMinutes == m then return end
+    pomodoro.config.workMinutes = m
+    -- Clear throttling so a banner can appear immediately if threshold already passed
+    pomodoro.nextBannerDue = nil
+    saveConfig()
+end
 
 -- ---- State -------------------------------------------------------
 pomodoro.state                        = {
@@ -63,10 +95,10 @@ local function resetUIHandles()
             notification.dismiss(pomodoro.overlayHandle); pomodoro.overlayHandle = nil
         end
     end
-    if pomodoro.enhancedNotificationElements then
+    if pomodoro.enhancedNotificationElements and notification.cleanupNotificationElements then
         notification.cleanupNotificationElements(pomodoro.enhancedNotificationElements)
-        pomodoro.enhancedNotificationElements = nil
     end
+    pomodoro.enhancedNotificationElements = nil
 end
 
 local function resetAlertState(ack)
@@ -137,10 +169,10 @@ end
 local function updateNotifications(now)
     if pomodoro.state.currentState ~= STATE.WORK then return end
     local workSec = pomodoro.state.workTime
+    local threshold = workThresholdSeconds()
 
     if pomodoro.notificationMode == NOTIFY_MODE.NONE then
-        if (workSec >= WORK_NOTIFICATION_TIME) and
-            (pomodoro.nextBannerDue == nil or now >= pomodoro.nextBannerDue) then
+        if (workSec >= threshold) and (pomodoro.nextBannerDue == nil or now >= pomodoro.nextBannerDue) then
             raiseAlert("banner", math.floor(workSec / 60))
         end
     elseif pomodoro.notificationMode == NOTIFY_MODE.BANNER then
@@ -151,7 +183,7 @@ local function updateNotifications(now)
     end
 end
 
--- ---- Persistence -------------------------------------------------
+-- ---- Persistence (state) ----------------------------------------
 local function saveState()
     hs.settings.set(PERSISTENCE_KEY, {
         currentState                 = pomodoro.state.currentState,
@@ -233,14 +265,18 @@ end
 
 -- ---- Public: init/stop ------------------------------------------
 function pomodoro.init()
+    loadConfig() -- ensure we have the user's preferred timer length before building the menu
+
     pomodoro.menuBar = hs.menubar.new()
     if pomodoro.menuBar then
         updateMenuBar()
+
         pomodoro.menuBar:setClickCallback(function()
             local info = hs.inspect(pomodoro.state):sub(1, 300)
             hs.alert.show(info, 5)
             return false
         end)
+
         pomodoro.menuBar:setMenu(function()
             return {
                 {
@@ -253,9 +289,37 @@ function pomodoro.init()
                     end
                 },
                 { title = "-" },
+
+                -- Timer length selector -----------------------------------
+                { title = "Timer length", disabled = true },
+                {
+                    title = "25 minutes",
+                    checked = (pomodoro.config.workMinutes == 25),
+                    fn = function()
+                        setWorkMinutes(25); updateMenuBar()
+                    end
+                },
+                {
+                    title = "35 minutes",
+                    checked = (pomodoro.config.workMinutes == 35),
+                    fn = function()
+                        setWorkMinutes(35); updateMenuBar()
+                    end
+                },
+                {
+                    title = "45 minutes",
+                    checked = (pomodoro.config.workMinutes == 45),
+                    fn = function()
+                        setWorkMinutes(45); updateMenuBar()
+                    end
+                },
+
+                { title = "-" },
+
+                -- Status readouts -----------------------------------------
                 { title = "Current: " .. formatMenu(pomodoro.state.currentState, pomodoro.state.workTime, pomodoro.state.idleTime),           disabled = true },
                 { title = string.format("Idle Time: %02d:%02d", math.floor(pomodoro.state.idleTime / 60), pomodoro.state.idleTime % 60),      disabled = true },
-                { title = string.format("Notify at: %d min", WORK_NOTIFICATION_TIME / 60),                                                    disabled = true },
+                { title = string.format("Notify at: %d min", pomodoro.config.workMinutes),                                                    disabled = true },
                 { title = string.format("Last notification acknowledged: %s", pomodoro.state.lastNotificationAcknowledged and "Yes" or "No"), disabled = true }
             }
         end)
