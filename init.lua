@@ -15,7 +15,7 @@ local STATE           = { WORK = 'work', IDLE = 'idle', FRESH = 'fresh' }
 local NOTIFY_MODE     = { NONE = "none", BANNER = "banner", OVERLAY = "overlay" }
 
 -- ---- Config (persisted) ------------------------------------------
-pomodoro.config       = { workMinutes = 25 } -- default
+pomodoro.config       = { workMinutes = 25, aiProvider = nil } -- nil, "claude", or "codex"
 
 local function saveConfig()
     hs.settings.set(CONFIG_KEY, { workMinutes = pomodoro.config.workMinutes })
@@ -52,7 +52,13 @@ pomodoro.state                        = {
     workTime = 0,
     idleTime = 0,
     lastUpdate = os.time(),
-    lastNotificationAcknowledged = true
+    lastNotificationAcknowledged = true,
+    messageHistory = {
+        messages = {},
+        maxHistory = 10,
+        pendingMessage = nil,
+        isGenerating = false
+    }
 }
 
 pomodoro.menuBar                      = nil
@@ -63,11 +69,68 @@ pomodoro.overlayHandle                = nil
 pomodoro.notificationMode             = NOTIFY_MODE.NONE
 pomodoro.notificationEntered          = nil
 pomodoro.nextBannerDue                = nil
+pomodoro.notificationCount            = 0
 
 pomodoro.enhancedNotificationElements = nil
 
 -- Optional no-op init (keeps API parity with notification.lua)
 if notification.init then notification.init() end
+
+-- ---- Message generation ------------------------------------------
+local function generateBreakMessage(minutes, count, history, callback)
+    local historyStr = #history > 0 and table.concat(history, "; ") or "none"
+
+    local prompt = string.format(
+        "Generate ONE sentence for a Pomodoro timer interrupting someone deep in focus. " ..
+        "Work time: %d minutes. Reminder number: %d. %s " ..
+        "Be genuinely compelling, insightful, or eye-opening, not guilt-tripping. " ..
+        "Don't repeat these approaches: %s " ..
+        "Return ONLY the sentence.",
+        minutes,
+        count,
+        count == 1 and "First reminder." or "Previous reminders were dismissed.",
+        historyStr
+    )
+
+    local fallback = string.format("You've been working for %d minutes — time to pause!", minutes)
+
+    -- Escape single quotes for a single-quoted string (replace ' with '\\'')
+    local escapedPrompt = prompt:gsub("'", "'\\''")
+    -- Use single quotes around the prompt to avoid double-quote escaping issues
+    local command = string.format("claude --print '%s'", escapedPrompt)
+    print(string.format("[Pomodoro] Full command: %s", command))
+
+    -- Run async in background thread to avoid blocking
+    hs.timer.doAfter(0, function()
+        -- hs.execute with 'true' uses user's login environment (full PATH)
+        local output, status, exitType, rc = hs.execute(command, true)
+
+        if status and output and output ~= "" then
+            local trimmed = output:gsub("^%s*(.-)%s*$", "%1")
+            callback(trimmed)
+        else
+            -- Log errors for debugging
+            print(string.format("[Pomodoro] Message generation failed. Status: %s, ExitType: %s, RC: %s, Output: %s",
+                tostring(status), tostring(exitType), tostring(rc), tostring(output)))
+            callback(fallback)
+        end
+    end)
+end
+
+local function prepareNextMessage()
+    if pomodoro.state.messageHistory.isGenerating then return end
+    if pomodoro.state.currentState ~= STATE.WORK then return end
+
+    pomodoro.state.messageHistory.isGenerating = true
+
+    local minutes = math.floor(pomodoro.state.workTime / 60)
+    local nextCount = pomodoro.notificationCount + 1
+
+    generateBreakMessage(minutes, nextCount, pomodoro.state.messageHistory.messages, function(message)
+        pomodoro.state.messageHistory.pendingMessage = message
+        pomodoro.state.messageHistory.isGenerating = false
+    end)
+end
 
 -- ---- Small helpers ----------------------------------------------
 local function formatMenu(state, work, idle)
@@ -106,6 +169,7 @@ local function resetAlertState(ack)
     pomodoro.notificationEntered                = nil
     pomodoro.nextBannerDue                      = nil
     pomodoro.state.lastNotificationAcknowledged = (ack ~= false)
+    pomodoro.notificationCount                  = 0
 end
 
 -- ---- State transitions ------------------------------------------
@@ -115,6 +179,13 @@ local function enterFresh(_reason)
     pomodoro.state.idleTime     = 0
     resetAlertState(true)
     resetUIHandles()
+    -- Clear message history when timer is fresh
+    pomodoro.state.messageHistory = {
+        messages = {},
+        maxHistory = 10,
+        pendingMessage = nil,
+        isGenerating = false
+    }
 end
 
 local function enterWork(resumed)
@@ -135,12 +206,12 @@ local ALERT = {
     banner  = {
         kind  = NOTIFY_MODE.BANNER,
         grace = BANNER_GRACE,
-        build = function(minutes, onAck) return notification.showBanner(minutes, onAck) end
+        build = function(message, onAck) return notification.showBanner(message, onAck) end
     },
     overlay = {
         kind  = NOTIFY_MODE.OVERLAY,
         grace = math.huge, -- never auto-escalate beyond overlay
-        build = function(minutes, onAck) return notification.showOverlay(minutes, onAck) end
+        build = function(message, onAck) return notification.showOverlay(message, onAck) end
     }
 }
 
@@ -148,7 +219,23 @@ local function raiseAlert(which, minutes)
     local cfg = ALERT[which]; if not cfg then return end
     resetUIHandles()
 
-    local handle = cfg.build(minutes, function()
+    pomodoro.notificationCount = pomodoro.notificationCount + 1
+
+    -- Use pre-generated message or fallback
+    local message = pomodoro.state.messageHistory.pendingMessage or
+                    string.format("You've been working for %d minutes — time to pause!", minutes)
+
+    -- Store in history
+    table.insert(pomodoro.state.messageHistory.messages, message)
+    if #pomodoro.state.messageHistory.messages > pomodoro.state.messageHistory.maxHistory then
+        table.remove(pomodoro.state.messageHistory.messages, 1)
+    end
+
+    -- Clear pending and start generating next
+    pomodoro.state.messageHistory.pendingMessage = nil
+    prepareNextMessage()
+
+    local handle = cfg.build(message, function()
         pomodoro.state.lastNotificationAcknowledged = true
         resetUIHandles()
         resetAlertState(true)
@@ -190,7 +277,9 @@ local function saveState()
         workTime                     = pomodoro.state.workTime,
         idleTime                     = pomodoro.state.idleTime,
         lastUpdate                   = os.time(),
-        lastNotificationAcknowledged = pomodoro.state.lastNotificationAcknowledged
+        lastNotificationAcknowledged = pomodoro.state.lastNotificationAcknowledged,
+        messageHistory               = pomodoro.state.messageHistory,
+        notificationCount            = pomodoro.notificationCount
     })
 end
 
@@ -209,6 +298,16 @@ local function loadState()
         pomodoro.state.idleTime                     = saved.idleTime or 0
         pomodoro.state.lastNotificationAcknowledged =
             (saved.lastNotificationAcknowledged == nil) and true or saved.lastNotificationAcknowledged
+        pomodoro.state.messageHistory               = saved.messageHistory or {
+            messages = {},
+            maxHistory = 10,
+            pendingMessage = nil,
+            isGenerating = false
+        }
+        -- Clear stale pending message and generation flag after reload
+        pomodoro.state.messageHistory.pendingMessage = nil
+        pomodoro.state.messageHistory.isGenerating = false
+        pomodoro.notificationCount                  = saved.notificationCount or 0
 
         if pomodoro.state.currentState == STATE.WORK and dt < IDLE_THRESHOLD then
             pomodoro.state.workTime = pomodoro.state.workTime + dt
@@ -247,6 +346,17 @@ local function timerCallback()
     else
         if pomodoro.state.currentState == STATE.WORK then
             pomodoro.state.workTime = pomodoro.state.workTime + elapsed
+
+            -- Pre-generate message 2 minutes before threshold (or after if we missed the window)
+            local threshold = workThresholdSeconds()
+            local timeUntilThreshold = threshold - pomodoro.state.workTime
+
+            if timeUntilThreshold <= 120 and
+               not pomodoro.state.messageHistory.pendingMessage and
+               not pomodoro.state.messageHistory.isGenerating then
+                prepareNextMessage()
+            end
+
             updateNotifications(now)
         elseif pomodoro.state.currentState == STATE.FRESH then
             enterWork(false) -- start new session
@@ -286,6 +396,15 @@ function pomodoro.init()
                         updateMenuBar()
                         saveState()
                         hs.alert.show("Timer reset")
+                    end
+                },
+                {
+                    title = "Test Message Generation",
+                    fn = function()
+                        local minutes = math.floor(pomodoro.state.workTime / 60)
+                        generateBreakMessage(minutes, 1, pomodoro.state.messageHistory.messages, function(message)
+                            hs.alert.show(message, 5)
+                        end)
                     end
                 },
                 { title = "-" },
