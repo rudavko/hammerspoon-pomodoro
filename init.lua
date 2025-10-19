@@ -15,10 +15,10 @@ local STATE           = { WORK = 'work', IDLE = 'idle', FRESH = 'fresh' }
 local NOTIFY_MODE     = { NONE = "none", BANNER = "banner", OVERLAY = "overlay" }
 
 -- ---- Config (persisted) ------------------------------------------
-pomodoro.config       = { workMinutes = 25, aiProvider = nil } -- nil, "claude", or "codex"
+pomodoro.config       = { workMinutes = 25, aiProvider = nil } -- nil, "claude", "codex", or "none"
 
 local function saveConfig()
-    hs.settings.set(CONFIG_KEY, { workMinutes = pomodoro.config.workMinutes })
+    hs.settings.set(CONFIG_KEY, { workMinutes = pomodoro.config.workMinutes, aiProvider = pomodoro.config.aiProvider })
 end
 
 local function loadConfig()
@@ -32,10 +32,30 @@ local function loadConfig()
             pomodoro.config.workMinutes = 25
         end
     end
+    if cfg and cfg.aiProvider then
+        pomodoro.config.aiProvider = cfg.aiProvider
+    end
 end
 
 local function workThresholdSeconds()
     return (pomodoro.config.workMinutes or 25) * 60
+end
+
+-- ---- AI Provider detection ---------------------------------------
+local function isCommandAvailable(cmd)
+    local output, status = hs.execute(string.format("command -v %s >/dev/null 2>&1", cmd), true)
+    return status == true
+end
+
+local function detectAIProvider()
+    -- Check in order of preference: claude, then codex
+    if isCommandAvailable("claude") then
+        return "claude"
+    elseif isCommandAvailable("codex") then
+        return "codex"
+    else
+        return "none"
+    end
 end
 
 local function setWorkMinutes(m)
@@ -94,24 +114,78 @@ local function generateBreakMessage(minutes, count, history, callback)
 
     local fallback = string.format("You've been working for %d minutes — time to pause!", minutes)
 
-    -- Escape single quotes for a single-quoted string (replace ' with '\\'')
+    -- Detect AI provider if not already set
+    if not pomodoro.config.aiProvider then
+        pomodoro.config.aiProvider = detectAIProvider()
+        saveConfig()
+    end
+
+    -- If no AI provider available, use fallback immediately
+    if pomodoro.config.aiProvider == "none" then
+        callback(fallback)
+        return
+    end
+
+    -- Escape single quotes for shell command
     local escapedPrompt = prompt:gsub("'", "'\\''")
-    -- Use single quotes around the prompt to avoid double-quote escaping issues
-    local command = string.format("claude --print '%s'", escapedPrompt)
-    print(string.format("[Pomodoro] Full command: %s", command))
+
+    -- Build command based on provider
+    local command
+    if pomodoro.config.aiProvider == "claude" then
+        command = string.format("claude --print '%s'", escapedPrompt)
+    elseif pomodoro.config.aiProvider == "codex" then
+        command = string.format("codex exec '%s' 2>&1", escapedPrompt)
+    else
+        callback(fallback)
+        return
+    end
+
+    print(string.format("[Pomodoro] Using %s: %s", pomodoro.config.aiProvider, command))
 
     -- Run async in background thread to avoid blocking
     hs.timer.doAfter(0, function()
-        -- hs.execute with 'true' uses user's login environment (full PATH)
         local output, status, exitType, rc = hs.execute(command, true)
 
         if status and output and output ~= "" then
-            local trimmed = output:gsub("^%s*(.-)%s*$", "%1")
-            callback(trimmed)
+            local trimmed = output
+
+            -- Parse output based on provider
+            if pomodoro.config.aiProvider == "codex" then
+                -- Skip the header lines from codex output
+                local lines = {}
+                for line in trimmed:gmatch("[^\r\n]+") do
+                    table.insert(lines, line)
+                end
+                -- Find the actual response (after the header section)
+                local responseStarted = false
+                local response = {}
+                for i, line in ipairs(lines) do
+                    if responseStarted then
+                        table.insert(response, line)
+                    elseif line:match("^%-%-%-%-") then
+                        -- Skip separator line, start collecting next line
+                        responseStarted = true
+                    elseif i > 10 and #line > 0 then
+                        -- No separator found, include this line and continue
+                        responseStarted = true
+                        table.insert(response, line)
+                    end
+                end
+                trimmed = table.concat(response, "\n")
+            end
+
+            -- Final trim
+            trimmed = trimmed:gsub("^%s*(.-)%s*$", "%1")
+
+            if #trimmed > 0 then
+                callback(trimmed)
+            else
+                print(string.format("[Pomodoro] Empty response from %s", pomodoro.config.aiProvider))
+                callback(fallback)
+            end
         else
-            -- Log errors for debugging
-            print(string.format("[Pomodoro] Message generation failed. Status: %s, ExitType: %s, RC: %s, Output: %s",
-                tostring(status), tostring(exitType), tostring(rc), tostring(output)))
+            print(string.format("[Pomodoro] %s failed. Status: %s, ExitType: %s, RC: %s",
+                pomodoro.config.aiProvider, tostring(status), tostring(exitType), tostring(rc)))
             callback(fallback)
         end
     end)
@@ -430,6 +504,20 @@ function pomodoro.init()
                     checked = (pomodoro.config.workMinutes == 45),
                     fn = function()
                         setWorkMinutes(45); updateMenuBar()
+                    end
+                },
+
+                { title = "-" },
+
+                -- AI Provider ---------------------------------------------
+                { title = string.format("AI Provider: %s", pomodoro.config.aiProvider or "auto"), disabled = true },
+                {
+                    title = "Re-detect AI Provider",
+                    fn = function()
+                        local old = pomodoro.config.aiProvider
+                        pomodoro.config.aiProvider = detectAIProvider()
+                        saveConfig()
+                        hs.alert.show(string.format("AI Provider: %s → %s", old or "none", pomodoro.config.aiProvider))
                     end
                 },
 
