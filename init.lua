@@ -15,10 +15,14 @@ local STATE           = { WORK = 'work', IDLE = 'idle', FRESH = 'fresh' }
 local NOTIFY_MODE     = { NONE = "none", BANNER = "banner", OVERLAY = "overlay" }
 
 -- ---- Config (persisted) ------------------------------------------
-pomodoro.config       = { workMinutes = 25, aiProvider = nil } -- nil, "claude", "codex", or "none"
+pomodoro.config       = { workMinutes = 25, aiProvider = nil, aiProviderPath = nil } -- nil, "claude", "codex", or "none"
 
 local function saveConfig()
-    hs.settings.set(CONFIG_KEY, { workMinutes = pomodoro.config.workMinutes, aiProvider = pomodoro.config.aiProvider })
+    hs.settings.set(CONFIG_KEY, {
+        workMinutes = pomodoro.config.workMinutes,
+        aiProvider = pomodoro.config.aiProvider,
+        aiProviderPath = pomodoro.config.aiProviderPath
+    })
 end
 
 local function loadConfig()
@@ -35,6 +39,9 @@ local function loadConfig()
     if cfg and cfg.aiProvider then
         pomodoro.config.aiProvider = cfg.aiProvider
     end
+    if cfg and cfg.aiProviderPath then
+        pomodoro.config.aiProviderPath = cfg.aiProviderPath
+    end
 end
 
 local function workThresholdSeconds()
@@ -42,20 +49,30 @@ local function workThresholdSeconds()
 end
 
 -- ---- AI Provider detection ---------------------------------------
-local function isCommandAvailable(cmd)
-    local output, status = hs.execute(string.format("command -v %s >/dev/null 2>&1", cmd), true)
-    return status == true
+local function getCommandPath(cmd)
+    local output, status = hs.execute(string.format("command -v %s 2>/dev/null", cmd), true)
+    if status and output and output ~= "" then
+        return output:gsub("^%s*(.-)%s*$", "%1")  -- trim whitespace
+    end
+    return nil
 end
 
 local function detectAIProvider()
     -- Check in order of preference: claude, then codex
-    if isCommandAvailable("claude") then
+    local claudePath = getCommandPath("claude")
+    if claudePath then
+        pomodoro.config.aiProviderPath = claudePath
         return "claude"
-    elseif isCommandAvailable("codex") then
-        return "codex"
-    else
-        return "none"
     end
+
+    local codexPath = getCommandPath("codex")
+    if codexPath then
+        pomodoro.config.aiProviderPath = codexPath
+        return "codex"
+    end
+
+    pomodoro.config.aiProviderPath = nil
+    return "none"
 end
 
 local function setWorkMinutes(m)
@@ -121,71 +138,111 @@ local function generateBreakMessage(minutes, count, history, callback)
     end
 
     -- If no AI provider available, use fallback immediately
-    if pomodoro.config.aiProvider == "none" then
+    if pomodoro.config.aiProvider == "none" or not pomodoro.config.aiProviderPath then
         callback(fallback)
         return
     end
 
-    -- Escape single quotes for shell command
-    local escapedPrompt = prompt:gsub("'", "'\\''")
-
     -- Build command based on provider
     local command
     if pomodoro.config.aiProvider == "claude" then
-        command = string.format("claude --print '%s'", escapedPrompt)
+        command = string.format("%s --print %q", pomodoro.config.aiProviderPath, prompt)
     elseif pomodoro.config.aiProvider == "codex" then
-        command = string.format("codex exec '%s' 2>&1", escapedPrompt)
+        command = string.format("%s exec %q", pomodoro.config.aiProviderPath, prompt)
     else
         callback(fallback)
         return
     end
 
-    print(string.format("[Pomodoro] Using %s: %s", pomodoro.config.aiProvider, command))
+    -- Create temp file for async output
+    local tmpFile = os.tmpname()
+    local claudeDir = pomodoro.config.aiProviderPath:match("(.+)/[^/]+$")
 
-    -- Run async in background thread to avoid blocking
-    hs.timer.doAfter(0, function()
-        local output, status, exitType, rc = hs.execute(command, true)
+    -- Write to a shell script for true background execution
+    local scriptFile = tmpFile .. ".sh"
+    local script = io.open(scriptFile, "w")
+    if script then
+        script:write("#!/bin/sh\n")
+        script:write(string.format("export PATH=%s:$PATH\n", claudeDir))
+        script:write(string.format("%s > %s 2>&1\n", command, tmpFile))
+        script:close()
+        os.execute("chmod +x " .. scriptFile)
+    end
 
-        if status and output and output ~= "" then
-            local trimmed = output
+    -- Execute script in background using os.execute (non-blocking with &)
+    os.execute(scriptFile .. " &")
 
-            -- Parse output based on provider
-            if pomodoro.config.aiProvider == "codex" then
-                -- Skip the header lines from codex output
-                local lines = {}
-                for line in trimmed:gmatch("[^\r\n]+") do
-                    table.insert(lines, line)
+    -- Poll the temp file until it has content
+    local pollCount = 0
+    local maxPolls = 60  -- 30 seconds max wait (60 * 0.5s)
+    local pollTimer = nil
+
+    pollTimer = hs.timer.doEvery(0.5, function()
+        pollCount = pollCount + 1
+
+        -- Check if file exists and has content
+        local file = io.open(tmpFile, "r")
+        if file then
+            local content = file:read("*all")
+            file:close()
+
+            if content and #content > 0 then
+                -- Stop polling
+                if pollTimer then
+                    pollTimer:stop()
+                    pollTimer = nil
                 end
-                -- Find the actual response (after the header section)
-                local responseStarted = false
-                local response = {}
-                for i, line in ipairs(lines) do
-                    if responseStarted then
-                        table.insert(response, line)
-                    elseif line:match("^%-%-%-%-") then
-                        -- Skip separator line, start collecting next line
-                        responseStarted = true
-                    elseif i > 10 and #line > 0 then
-                        -- No separator found, include this line and continue
-                        responseStarted = true
-                        table.insert(response, line)
+
+                local trimmed = content
+
+                -- Parse output based on provider
+                if pomodoro.config.aiProvider == "codex" then
+                    -- Skip the header lines from codex output
+                    local lines = {}
+                    for line in trimmed:gmatch("[^\r\n]+") do
+                        table.insert(lines, line)
                     end
+                    -- Find the actual response (after the header section)
+                    local responseStarted = false
+                    local response = {}
+                    for i, line in ipairs(lines) do
+                        if responseStarted then
+                            table.insert(response, line)
+                        elseif line:match("^%-%-%-%-") then
+                            -- Skip separator line, start collecting next line
+                            responseStarted = true
+                        elseif i > 10 and #line > 0 then
+                            -- No separator found, include this line and continue
+                            responseStarted = true
+                            table.insert(response, line)
+                        end
+                    end
+                    trimmed = table.concat(response, "\n")
                 end
-                trimmed = table.concat(response, "\n")
-            end
 
-            -- Final trim
-            trimmed = trimmed:gsub("^%s*(.-)%s*$", "%1")
+                -- Final trim
+                trimmed = trimmed:gsub("^%s*(.-)%s*$", "%1")
 
-            if #trimmed > 0 then
-                callback(trimmed)
-            else
-                print(string.format("[Pomodoro] Empty response from %s", pomodoro.config.aiProvider))
-                callback(fallback)
+                -- Clean up temp files
+                os.remove(tmpFile)
+                os.remove(scriptFile)
+
+                if #trimmed > 0 then
+                    callback(trimmed)
+                else
+                    callback(fallback)
+                end
             end
-        else
-            print(string.format("[Pomodoro] %s failed. Status: %s, ExitType: %s, RC: %s",
-                pomodoro.config.aiProvider, tostring(status), tostring(exitType), tostring(rc)))
+        end
+
+        -- Timeout after max polls
+        if pollCount >= maxPolls then
+            if pollTimer then
+                pollTimer:stop()
+                pollTimer = nil
+            end
+            os.remove(tmpFile)
+            os.remove(scriptFile)
             callback(fallback)
         end
     end)
@@ -411,11 +468,11 @@ local function timerCallback()
 
     if idleForReset >= RESET_THRESHOLD then
         if pomodoro.state.currentState ~= STATE.FRESH then enterFresh("idle-timeout") end
-    elseif idle >= IDLE_THRESHOLD then
+    elseif idleForReset >= IDLE_THRESHOLD then
         if pomodoro.state.currentState == STATE.WORK then
-            enterIdle(idle)
+            enterIdle(idleForReset)
         elseif pomodoro.state.currentState == STATE.IDLE then
-            enterIdle(idle)
+            enterIdle(idleForReset)
         end
     else
         if pomodoro.state.currentState == STATE.WORK then
