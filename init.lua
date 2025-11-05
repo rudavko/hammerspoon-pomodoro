@@ -163,7 +163,9 @@ local function generateBreakMessage(minutes, count, history, callback)
     local script = io.open(scriptFile, "w")
     if script then
         script:write("#!/bin/sh\n")
-        script:write(string.format("export PATH=%s:$PATH\n", claudeDir))
+        if claudeDir then
+            script:write(string.format("export PATH=%s:$PATH\n", claudeDir))
+        end
         script:write(string.format("%s > %s 2>&1\n", command, tmpFile))
         script:close()
         os.execute("chmod +x " .. scriptFile)
