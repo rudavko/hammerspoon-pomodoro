@@ -8,7 +8,7 @@ local M = {}
 function M.init() end
 
 -- Banner ----------------------------------------------------------
-function M.showBanner(minutes, onClick)
+function M.showBanner(message, onClick)
     local n = hs.notify.new(
         function(_, ev)
             -- Treat user click ("activated") and user dismissal ("removed") as acknowledgments
@@ -16,7 +16,7 @@ function M.showBanner(minutes, onClick)
         end,
         {
             title = "Pomodoro",
-            informativeText = string.format("You've been working for %d min – time to pause!", minutes),
+            informativeText = message,
             hasActionButton = false
         }
     )
@@ -25,9 +25,9 @@ function M.showBanner(minutes, onClick)
 end
 
 -- Overlay ---------------------------------------------------------
-local function buildOverlay(minutes, onDismiss)
+local function buildOverlay(message, onDismiss)
     local obj = { canvases = {} }
-    local msg = string.format("⏰  %d minutes of focus reached — take a break!", minutes)
+    local msg = message
     local dark = (hs.host.interfaceStyle() == "Dark")
     local pCol = dark and { white = 0.15, alpha = 0.95 } or { white = 1, alpha = 0.95 }
     local tCol = dark and { white = 1 } or { white = 0 }
@@ -73,8 +73,8 @@ local function buildOverlay(minutes, onDismiss)
     return obj
 end
 
-function M.showOverlay(minutes, onDismiss)
-    return buildOverlay(minutes, onDismiss)
+function M.showOverlay(message, onDismiss)
+    return buildOverlay(message, onDismiss)
 end
 
 -- Dismiss ---------------------------------------------------------
